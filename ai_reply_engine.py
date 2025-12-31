@@ -97,7 +97,7 @@ class AIReplyEngine:
         model_name = settings.get('model_name', '').lower()
         return 'gemini' in model_name
 
-    def _call_dashscope_api(self, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
+    def _call_dashscope_api(self, settings: dict, messages: list, max_tokens: int = 1024, temperature: float = 0.7) -> str:
         """调用DashScope API"""
         base_url = settings['base_url']
         if '/apps/' in base_url:
@@ -136,7 +136,7 @@ class AIReplyEngine:
         logger.info(f"发送的prompt: {prompt[:100]}...") # 避免 prompt 过长
         logger.debug(f"请求数据: {json.dumps(data, ensure_ascii=False)}")
 
-        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response = requests.post(url, headers=headers, json=data, timeout=180)
 
         if response.status_code != 200:
             logger.error(f"DashScope API请求失败: {response.status_code} - {response.text}")
@@ -150,7 +150,7 @@ class AIReplyEngine:
         else:
             raise Exception(f"DashScope API响应格式错误: {result}")
 
-    def _call_gemini_api(self, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
+    def _call_gemini_api(self, settings: dict, messages: list, max_tokens: int = 1024, temperature: float = 0.7) -> str:
         """
         调用Google Gemini REST API (v1beta)
         """
@@ -203,7 +203,7 @@ class AIReplyEngine:
         logger.info(f"Calling Gemini REST API: {url.split('?')[0]}")
         logger.debug(f"Gemini Payload: {json.dumps(payload, ensure_ascii=False)}")
         
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
 
         if response.status_code != 200:
             logger.error(f"Gemini API 请求失败: {response.status_code} - {response.text}")
@@ -219,7 +219,7 @@ class AIReplyEngine:
             logger.error(f"Gemini API 响应格式错误: {result} - {e}")
             raise Exception(f"Gemini API 响应格式错误: {result}")
 
-    def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
+    def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 8319, temperature: float = 0.7) -> str:
         """调用OpenAI兼容API"""
         try:
             logger.info(f"调用OpenAI API: model={settings['model_name']}, base_url={settings.get('base_url', 'default')}")
@@ -227,7 +227,8 @@ class AIReplyEngine:
                 model=settings['model_name'],
                 messages=messages,
                 max_tokens=max_tokens,
-                temperature=temperature
+                temperature=temperature,
+                timeout=180
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -291,8 +292,19 @@ class AIReplyEngine:
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str,
-                      skip_wait: bool = False) -> Optional[str]:
-        """生成AI回复"""
+                      skip_wait: bool = False, image_urls: list = None) -> Optional[str]:
+        """生成AI回复
+        
+        Args:
+            message: 用户消息文本
+            item_info: 商品信息
+            chat_id: 聊天ID
+            cookie_id: Cookie ID
+            user_id: 用户ID
+            item_id: 商品ID
+            skip_wait: 是否跳过内部等待
+            image_urls: 用户发送的图片URL列表（用于多模态AI）
+        """
         if not self.is_ai_enabled(cookie_id):
             return None
         
@@ -385,20 +397,34 @@ class AIReplyEngine:
 请根据以上信息生成回复："""
 
                 # 10. 调用AI生成回复
+                # 构建用户消息内容（支持多模态：文本+图片）
+                if image_urls and len(image_urls) > 0:
+                    # 多模态消息格式（OpenAI兼容格式）
+                    user_content = [{"type": "text", "text": user_prompt}]
+                    for img_url in image_urls:
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": img_url}
+                        })
+                    logger.info(f"【{cookie_id}】构建多模态消息，包含 {len(image_urls)} 张图片")
+                else:
+                    # 纯文本消息
+                    user_content = user_prompt
+                
                 messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_content}
                 ]
 
                 reply = None # 初始化 reply 变量
 
                 if self._is_dashscope_api(settings):
                     logger.info(f"使用DashScope API生成回复")
-                    reply = self._call_dashscope_api(settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_dashscope_api(settings, messages, max_tokens=1024, temperature=0.7)
                 
                 elif self._is_gemini_api(settings):
                     logger.info(f"使用Gemini API生成回复")
-                    reply = self._call_gemini_api(settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_gemini_api(settings, messages, max_tokens=1024, temperature=0.7)
                 
                 else:
                     logger.info(f"使用OpenAI兼容API生成回复")
@@ -407,7 +433,7 @@ class AIReplyEngine:
                     if not client:
                         return None
                     logger.info(f"messages:{messages}")
-                    reply = self._call_openai_api(client, settings, messages, max_tokens=100, temperature=0.7)
+                    reply = self._call_openai_api(client, settings, messages, max_tokens=8319, temperature=0.7)
 
                 # 11. 保存AI回复到对话记录
                 self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent)
@@ -430,14 +456,14 @@ class AIReplyEngine:
 
     async def generate_reply_async(self, message: str, item_info: dict, chat_id: str,
                                    cookie_id: str, user_id: str, item_id: str,
-                                   skip_wait: bool = False) -> Optional[str]:
+                                   skip_wait: bool = False, image_urls: list = None) -> Optional[str]:
         """
         异步包装器：在独立线程池中执行同步的 `generate_reply`，并返回结果。
         这样可以在异步代码中直接 await，而不阻塞事件循环。
         """
         try:
             import asyncio as _asyncio
-            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait)
+            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait, image_urls)
         except Exception as e:
             logger.error(f"异步生成回复失败: {e}")
             return None

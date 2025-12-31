@@ -129,44 +129,112 @@ class SecureConfirm:
         sign = generate_sign(params['t'], token, data_val)
         params['sign'] = sign
 
+        # 构建请求头，必须包含Cookie
+        headers = {
+            'accept': 'application/json',
+            'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://www.goofish.com',
+            'referer': 'https://www.goofish.com/',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'cookie': self.cookies_str
+        }
+
         try:
             logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {order_id}")
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
-                params=params,
-                data=data
-            ) as response:
-                res_json = await response.json()
-
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self._update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
-
-                logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
-
-                # 检查响应结果
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
-                    return {"success": True, "order_id": order_id}
-                else:
-                    error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
-
+            
+            # 【修复】使用 asyncio.wait_for 包装请求，避免 aiohttp 内部超时上下文错误
+            async def do_confirm_request():
+                async with self.session.post(
+                    'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
+                    params=params,
+                    data=data,
+                    headers=headers
+                ) as response:
+                    res_json = await response.json()
+                    # 返回响应头和JSON数据（使用不同变量名避免作用域冲突）
+                    response_headers = dict(response.headers)
+                    return response_headers, res_json
+            
+            try:
+                response_headers, res_json = await asyncio.wait_for(do_confirm_request(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.error(f"【{self.cookie_id}】自动确认发货请求超时（30秒）")
+                if retry_count < 2:
+                    logger.info(f"【{self.cookie_id}】超时，准备重试...")
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                return {"error": "请求超时", "order_id": order_id}
 
+            # 检查并更新Cookie
+            if 'set-cookie' in response_headers or 'Set-Cookie' in response_headers:
+                new_cookies = {}
+                cookie_header = response_headers.get('set-cookie') or response_headers.get('Set-Cookie', '')
+                if isinstance(cookie_header, str):
+                    cookie_list = [cookie_header]
+                else:
+                    cookie_list = cookie_header if isinstance(cookie_header, list) else []
+                
+                for cookie in cookie_list:
+                    if '=' in cookie:
+                        name, value = cookie.split(';')[0].split('=', 1)
+                        new_cookies[name.strip()] = value.strip()
+
+                # 更新cookies
+                if new_cookies:
+                    self.cookies.update(new_cookies)
+                    # 生成新的cookie字符串
+                    self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                    # 更新数据库中的Cookie
+                    await self._update_config_cookies()
+                    logger.debug("已更新Cookie到数据库")
+
+            logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
+
+            # 检查响应结果
+            if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+                logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
+                return {"success": True, "order_id": order_id}
+            else:
+                error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
+                logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+
+                # 检测Token过期错误，触发强制刷新后再重试
+                if ('TOKEN_EXOIRED' in error_msg or 'TOKEN_EXPIRED' in error_msg or 'ILLEGAL_ACCESS' in error_msg):
+                    if retry_count < 2 and self.main_instance:
+                        logger.info(f"【{self.cookie_id}】检测到Token过期，触发强制刷新...")
+                        
+                        # 调用主实例的强制刷新方法（绕过冷却机制）
+                        try:
+                            refresh_success = await self.main_instance.force_refresh_token()
+                            
+                            if refresh_success:
+                                # 刷新成功，同步最新cookies后重试
+                                self.cookies_str = self.main_instance.cookies_str
+                                self.cookies = trans_cookies(self.cookies_str)
+                                logger.info(f"【{self.cookie_id}】Token刷新成功，准备重试确认发货...")
+                                await asyncio.sleep(1)  # 等待1秒让新Token生效
+                                return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                            else:
+                                logger.warning(f"【{self.cookie_id}】Token刷新失败，将订单加入待确认队列...")
+                                # 将订单加入待确认队列，等下次Token刷新成功后自动重试
+                                await self.main_instance.add_pending_confirm_order(order_id, item_id)
+                                return {"error": "Token刷新失败，已加入待确认队列", "order_id": order_id, "queued": True}
+                        except Exception as refresh_e:
+                            logger.error(f"【{self.cookie_id}】强制刷新Token异常: {self._safe_str(refresh_e)}")
+                            # 刷新异常时也加入队列
+                            try:
+                                await self.main_instance.add_pending_confirm_order(order_id, item_id)
+                            except:
+                                pass
+                            return {"error": f"Token刷新异常: {self._safe_str(refresh_e)}", "order_id": order_id}
+                    else:
+                        # 没有主实例或重试次数已达上限，尝试从主实例同步cookies后重试
+                        if self.main_instance:
+                            self.cookies_str = self.main_instance.cookies_str
+                            self.cookies = trans_cookies(self.cookies_str)
+                            logger.info(f"【{self.cookie_id}】已同步最新cookies，准备重试...")
+
+                return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】自动确认发货API请求异常: {self._safe_str(e)}")
