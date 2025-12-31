@@ -1192,7 +1192,7 @@ async def send_message_api(request: SendMessageRequest):
             )
 
         # 特殊测试秘钥处理
-        if cleaned_api_key == "zhinina_test_key":
+        if cleaned_api_key == "mochoo_test_key":
             logger.info("使用测试秘钥，直接返回成功")
             return SendMessageResponse(
                 success=True,

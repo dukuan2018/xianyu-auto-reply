@@ -14,11 +14,11 @@ export default defineConfig(({ command }) => ({
     port: 3000,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/login': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           if (req.method === 'GET') {
@@ -27,32 +27,32 @@ export default defineConfig(({ command }) => ({
         },
       },
       '/verify': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/cookies': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/delivery-rules': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/system-settings': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/logs': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/users': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       // 管理员API - 前端有 /admin/* 路由，需要区分浏览器访问和 API 请求
       '/admin': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           // 浏览器直接访问（Accept 包含 text/html）时，让前端路由处理
@@ -62,39 +62,39 @@ export default defineConfig(({ command }) => ({
         },
       },
       '/risk-control-logs': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/qrcode': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/generate-captcha': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/verify-captcha': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/send-verification-code': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/registration-status': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/login-info-status': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/geetest': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/register': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           // 浏览器直接访问时返回前端页面，只有 POST 请求才代理到后端
@@ -104,88 +104,88 @@ export default defineConfig(({ command }) => ({
         },
       },
       '/itemReplays': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/item-reply': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/default-replies': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/ai-reply-settings': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/ai-reply-test': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/password-login': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/qr-login': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/keywords-export': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/keywords-import': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/upload-image': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/default-reply': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/static': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/backup': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/project-stats': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/change-password': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/change-admin-password': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/check-default-password': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/logout': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/user-settings': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       '/search': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
       // 商品管理 - 前端有 /items 路由，需要区分浏览器访问和 API 请求
       '/items': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           // 只有浏览器直接访问 /items 路径时才返回前端页面
@@ -200,7 +200,7 @@ export default defineConfig(({ command }) => ({
       },
       // 卡券管理 - 前端有 /cards 路由
       '/cards': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           if (req.headers.accept?.includes('text/html')) {
@@ -210,7 +210,7 @@ export default defineConfig(({ command }) => ({
       },
       // 通知渠道 - 前端有 /notification-channels 路由
       '/notification-channels': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           if (req.headers.accept?.includes('text/html')) {
@@ -220,7 +220,7 @@ export default defineConfig(({ command }) => ({
       },
       // 消息通知 - 前端有 /message-notifications 路由
       '/message-notifications': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           if (req.headers.accept?.includes('text/html')) {
@@ -230,7 +230,7 @@ export default defineConfig(({ command }) => ({
       },
       // 关键词 - 前端有 /keywords 路由
       '/keywords': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
         bypass: (req) => {
           if (req.headers.accept?.includes('text/html')) {
@@ -240,7 +240,7 @@ export default defineConfig(({ command }) => ({
       },
       // 订单 API - 后端路径是 /api/orders
       '/api/orders': {
-        target: 'http://127.0.0.1:8080',
+        target: 'http://127.0.0.1:8888',
         changeOrigin: true,
       },
     },

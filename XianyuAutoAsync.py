@@ -7277,10 +7277,10 @@ class XianyuLive:
                     if isinstance(message_1, dict):
                         create_time = message_1.get("5", 0)
                 # 使用组合键作为备用标识
-                message_id = f"{chat_id}_{send_message}_{create_time}"
+                message_id = f"{chat_id}_{send_message}_{str(image_urls)}_{create_time}"
             except Exception:
                 # 如果提取失败，使用当前时间戳
-                message_id = f"{chat_id}_{send_message}_{int(time.time() * 1000)}"
+                message_id = f"{chat_id}_{send_message}_{str(image_urls)}_{int(time.time() * 1000)}"
         
         async with self.processed_message_ids_lock:
             current_time = time.time()
@@ -7434,9 +7434,9 @@ class XianyuLive:
 
             reply = None
             # 判断是否启用API回复
-            api_info = AUTO_REPLY.get('api', {})
-            if api_info.get('enabled', False):
-                if api_info.get('send_type') == 'all' or (api_info.get('send_type') == 'img' and any(image_urls)):
+            api_config = AUTO_REPLY.get('api', {})
+            if api_config.get('enabled', False):
+                if api_config.get('send_type') == 'all' or (api_config.get('send_type') == 'img' and any(image_urls)):
                     reply = await self.get_api_reply(
                         msg_time, user_url, send_user_id, send_user_name,
                         item_id, send_message, chat_id,image_urls
