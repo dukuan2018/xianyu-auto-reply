@@ -57,6 +57,25 @@ class CookieManager:
         return True
 
     # ------------------------ 内部协程 ------------------------
+    def _get_running_task(self, cookie_id: str) -> Optional[asyncio.Task]:
+        task = self.tasks.get(cookie_id)
+        if task and not task.done():
+            return task
+        if task and task.done():
+            self.tasks.pop(cookie_id, None)
+        return None
+
+    def _create_cookie_task(self, cookie_id: str, cookie_value: str, user_id: int = None) -> asyncio.Task:
+        existing_task = self._get_running_task(cookie_id)
+        if existing_task:
+            logger.warning(f"【{cookie_id}】账号任务已在运行，跳过重复启动")
+            return existing_task
+
+        task = self.loop.create_task(self._run_xianyu(cookie_id, cookie_value, user_id))
+        self.tasks[cookie_id] = task
+        logger.info(f"【{cookie_id}】账号任务已创建 (用户ID: {user_id})")
+        return task
+
     async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
         """在事件循环中启动 XianyuLive.main"""
         logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")
@@ -148,8 +167,7 @@ class CookieManager:
                 if cookie_info:
                     actual_user_id = cookie_info.get('user_id')
 
-            task = self.loop.create_task(self._run_xianyu(cookie_id, cookie_value, actual_user_id))
-            self.tasks[cookie_id] = task
+            task = self._create_cookie_task(cookie_id, cookie_value, actual_user_id)
             logger.info(f"已启动账号任务: {cookie_id} (用户ID: {actual_user_id})")
 
     async def _remove_cookie_async(self, cookie_id: str):
@@ -271,8 +289,7 @@ class CookieManager:
                 self.cookie_status[cookie_id] = original_status
 
                 # 重新启动任务
-                task = self.loop.create_task(self._run_xianyu(cookie_id, new_value, original_user_id))
-                self.tasks[cookie_id] = task
+                task = self._create_cookie_task(cookie_id, new_value, original_user_id)
 
                 logger.info(f"已更新Cookie并重启任务: {cookie_id} (用户ID: {original_user_id}, 关键词: {len(original_keywords)}条)")
 
@@ -356,8 +373,7 @@ class CookieManager:
                 fut.result(timeout=5)  # 等待最多5秒
             else:
                 # 事件循环未运行，直接创建任务
-                task = self.loop.create_task(self._run_xianyu(cookie_id, cookie_value, user_id))
-                self.tasks[cookie_id] = task
+                task = self._create_cookie_task(cookie_id, cookie_value, user_id)
 
             logger.info(f"成功启动Cookie任务: {cookie_id}")
         except Exception as e:
@@ -483,8 +499,7 @@ class CookieManager:
                 self.cookie_status[cookie_id] = original_status
 
                 # 重新启动任务
-                new_task = self.loop.create_task(self._run_xianyu(cookie_id, new_cookie_value, original_user_id))
-                self.tasks[cookie_id] = new_task
+                new_task = self._create_cookie_task(cookie_id, new_cookie_value, original_user_id)
 
                 # 短暂等待并验证任务是否正常启动
                 await asyncio.sleep(0.1)

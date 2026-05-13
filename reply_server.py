@@ -16,6 +16,8 @@ import uvicorn
 import pandas as pd
 import io
 import asyncio
+import base64
+import aiohttp
 from collections import defaultdict
 
 import cookie_manager
@@ -1142,6 +1144,15 @@ class SendMessageRequest(BaseModel):
     message: str
 
 
+class SendImageRequest(BaseModel):
+    cookie_id: str
+    chat_id: str
+    to_user_id: str
+    image_base64: Optional[str] = None
+    image_url: Optional[str] = None
+    filename: Optional[str] = "api_image.jpg"
+
+
 class SendMessageResponse(BaseModel):
     success: bool
     message: str
@@ -1165,6 +1176,41 @@ def verify_api_key(api_key: str) -> bool:
         return api_key == API_SECRET_KEY
 
 
+def decode_image_base64(image_base64: str) -> bytes:
+    """Decode plain base64 or data URL image payload."""
+    if not image_base64:
+        raise ValueError("图片base64数据不能为空")
+
+    payload = image_base64.strip()
+    if "," in payload and payload.lower().startswith("data:"):
+        payload = payload.split(",", 1)[1]
+
+    try:
+        return base64.b64decode(payload, validate=True)
+    except Exception as e:
+        raise ValueError(f"图片base64数据格式不正确: {e}")
+
+
+async def download_image_url(image_url: str) -> bytes:
+    """Download image bytes from a remote URL."""
+    if not image_url:
+        raise ValueError("图片URL不能为空")
+    if not image_url.lower().startswith(("http://", "https://")):
+        raise ValueError("图片URL仅支持http或https")
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(image_url) as response:
+            if response.status != 200:
+                raise ValueError(f"图片下载失败: HTTP {response.status}")
+
+            content_type = response.headers.get("Content-Type", "")
+            if content_type and not content_type.lower().startswith("image/"):
+                logger.warning(f"图片URL返回的Content-Type不是image: {content_type}")
+
+            return await response.read()
+
+
 @app.post('/send-message', response_model=SendMessageResponse)
 async def send_message_api(request: SendMessageRequest):
     """发送消息API接口（使用秘钥验证）"""
@@ -1177,7 +1223,6 @@ async def send_message_api(request: SendMessageRequest):
             return param_str
 
         # 清理所有参数
-        cleaned_api_key = clean_param(request.api_key)
         cleaned_cookie_id = clean_param(request.cookie_id)
         cleaned_chat_id = clean_param(request.chat_id)
         cleaned_to_user_id = clean_param(request.to_user_id)
@@ -1266,6 +1311,74 @@ async def send_message_api(request: SendMessageRequest):
             success=False,
             message=f"发送消息失败: {str(e)}"
         )
+
+
+@app.post('/send-image', response_model=SendMessageResponse)
+async def send_image_api(request: SendImageRequest):
+    """发送图片消息API接口（使用秘钥验证）"""
+    try:
+        def clean_param(param_str):
+            if isinstance(param_str, str):
+                return param_str.replace('\\n', '').replace('\n', '').strip()
+            return param_str
+
+        cleaned_cookie_id = clean_param(request.cookie_id)
+        cleaned_chat_id = clean_param(request.chat_id)
+        cleaned_to_user_id = clean_param(request.to_user_id)
+        cleaned_image_url = clean_param(request.image_url)
+        cleaned_filename = clean_param(request.filename) or "api_image.jpg"
+
+        required_params = {
+            'cookie_id': cleaned_cookie_id,
+            'chat_id': cleaned_chat_id,
+            'to_user_id': cleaned_to_user_id,
+        }
+        for param_name, param_value in required_params.items():
+            if not param_value:
+                logger.warning(f"必需参数 {param_name} 为空")
+                return SendMessageResponse(success=False, message=f"参数 {param_name} 不能为空")
+
+        if not request.image_base64 and not cleaned_image_url:
+            return SendMessageResponse(success=False, message="参数 image_base64 或 image_url 至少提供一个")
+
+        if request.image_base64:
+            image_data = decode_image_base64(request.image_base64)
+        else:
+            image_data = await download_image_url(cleaned_image_url)
+
+        saved_image_path = image_manager.save_image(image_data, cleaned_filename)
+        if not saved_image_path:
+            return SendMessageResponse(success=False, message="图片保存失败，请检查图片格式、大小或base64数据")
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cleaned_cookie_id)
+
+        if not live_instance:
+            logger.warning(f"账号实例不存在或未连接: {cleaned_cookie_id}")
+            return SendMessageResponse(success=False, message="账号实例不存在或未连接，请检查账号状态")
+
+        if not live_instance.ws or getattr(live_instance.ws, "closed", False):
+            logger.warning(f"账号WebSocket连接已断开: {cleaned_cookie_id}")
+            return SendMessageResponse(success=False, message="账号WebSocket连接已断开，请等待重连")
+
+        success = await live_instance.send_image_from_file(
+            live_instance.ws,
+            cleaned_chat_id,
+            cleaned_to_user_id,
+            saved_image_path
+        )
+
+        if not success:
+            return SendMessageResponse(success=False, message="图片发送失败，请检查Cookie、图片上传状态或账号连接")
+
+        logger.info(f"API成功发送图片: {cleaned_cookie_id} -> {cleaned_to_user_id}, chat_id={cleaned_chat_id}, image={saved_image_path}")
+        return SendMessageResponse(success=True, message="图片发送成功")
+
+    except Exception as e:
+        cookie_id_for_log = request.cookie_id
+        to_user_id_for_log = request.to_user_id
+        logger.error(f"API发送图片异常: {cookie_id_for_log} -> {to_user_id_for_log}, 错误: {str(e)}")
+        return SendMessageResponse(success=False, message=f"发送图片失败: {str(e)}")
 
 
 @app.post("/xianyu/reply", response_model=ResponseModel)
@@ -1825,12 +1938,12 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                 
                                 # 在后台启动任务（使用线程安全的方式，因为run_login是在后台线程中运行的）
                                 try:
-                                    # 尝试使用run_coroutine_threadsafe，这是线程安全的方式
-                                    fut = asyncio.run_coroutine_threadsafe(
-                                        cookie_manager.manager._run_xianyu(account_id, cookies_str, user_id),
-                                        loop
+                                    loop.call_soon_threadsafe(
+                                        cookie_manager.manager._create_cookie_task,
+                                        account_id,
+                                        cookies_str,
+                                        user_id
                                     )
-                                    # 不等待结果，让它在后台运行
                                     log_with_user('info', f"已启动新账号任务: {account_id}", current_user)
                                 except RuntimeError as e:
                                     # 如果事件循环未运行，记录警告但不影响登录成功

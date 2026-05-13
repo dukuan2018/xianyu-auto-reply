@@ -177,6 +177,11 @@ class XianyuLive:
     # 类级别的实例管理字典，用于API调用
     _instances = {}  # {cookie_id: XianyuLive实例}
     _instances_lock = asyncio.Lock()
+
+    # 类级别消息去重：防止同一个账号被意外启动多个监听实例时重复处理同一条消息
+    _global_processed_message_ids = {}
+    _global_processed_message_ids_lock = asyncio.Lock()
+    _global_processed_message_ids_max_size = 50000
     
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
@@ -7265,6 +7270,13 @@ class XianyuLive:
             msg_time: 消息时间
             image_urls: 用户发送的图片URL列表
         """
+        image_urls = image_urls or []
+        image_dedupe_key = None
+        if image_urls:
+            normalized_image_urls = tuple(sorted(str(url).strip() for url in image_urls if url))
+            if normalized_image_urls:
+                image_dedupe_key = f"image:{chat_id}:{send_user_id}:{normalized_image_urls}"
+
         # 提取消息ID并检查是否已处理
         message_id = self._extract_message_id(message_data)
         # 如果没有 messageId，使用备用标识（chat_id + send_message + 时间戳）
@@ -7282,8 +7294,72 @@ class XianyuLive:
                 # 如果提取失败，使用当前时间戳
                 message_id = f"{chat_id}_{send_message}_{str(image_urls)}_{int(time.time() * 1000)}"
         
+        global_message_id = f"{self.cookie_id}:{message_id}"
+        global_image_dedupe_key = f"{self.cookie_id}:{image_dedupe_key}" if image_dedupe_key else None
+
+        async with XianyuLive._global_processed_message_ids_lock:
+            current_time = time.time()
+
+            for dedupe_key, dedupe_desc in (
+                (global_image_dedupe_key, "买家重复发送相同图片"),
+                (global_message_id, f"消息ID {message_id[:50]}..."),
+            ):
+                if not dedupe_key:
+                    continue
+                last_process_time = XianyuLive._global_processed_message_ids.get(dedupe_key)
+                if not last_process_time:
+                    continue
+
+                time_elapsed = current_time - last_process_time
+                if time_elapsed < self.message_expire_time:
+                    remaining_time = int(self.message_expire_time - time_elapsed)
+                    logger.warning(
+                        f"【{self.cookie_id}】跨实例去重命中：{dedupe_desc} 已处理过，"
+                        f"跳过API和自动回复处理，距离可重新处理还需 {remaining_time} 秒"
+                    )
+                    return
+
+                logger.info(
+                    f"【{self.cookie_id}】跨实例去重记录已超过 {int(time_elapsed/60)} 分钟，允许重新处理: {dedupe_desc}"
+                )
+
+            XianyuLive._global_processed_message_ids[global_message_id] = current_time
+            if global_image_dedupe_key:
+                XianyuLive._global_processed_message_ids[global_image_dedupe_key] = current_time
+
+            if len(XianyuLive._global_processed_message_ids) > XianyuLive._global_processed_message_ids_max_size:
+                expired_ids = [
+                    msg_id for msg_id, timestamp in XianyuLive._global_processed_message_ids.items()
+                    if current_time - timestamp > self.message_expire_time
+                ]
+                for msg_id in expired_ids:
+                    del XianyuLive._global_processed_message_ids[msg_id]
+
+                if len(XianyuLive._global_processed_message_ids) > XianyuLive._global_processed_message_ids_max_size:
+                    sorted_ids = sorted(XianyuLive._global_processed_message_ids.items(), key=lambda x: x[1])
+                    remove_count = len(sorted_ids) // 2
+                    for msg_id, _ in sorted_ids[:remove_count]:
+                        del XianyuLive._global_processed_message_ids[msg_id]
+                    logger.info(f"【{self.cookie_id}】全局消息去重字典过大，已清理 {remove_count} 个最旧记录")
+
         async with self.processed_message_ids_lock:
             current_time = time.time()
+
+            if image_dedupe_key:
+                last_image_process_time = self.processed_message_ids.get(image_dedupe_key)
+                if last_image_process_time:
+                    time_elapsed = current_time - last_image_process_time
+                    if time_elapsed < self.message_expire_time:
+                        remaining_time = int(self.message_expire_time - time_elapsed)
+                        logger.warning(
+                            f"【{self.cookie_id}】买家重复发送相同图片，跳过API和自动回复处理，"
+                            f"距离可重新处理还需 {remaining_time} 秒"
+                        )
+                        return
+                    else:
+                        logger.info(
+                            f"【{self.cookie_id}】相同图片已超过 {int(time_elapsed/60)} 分钟，允许重新处理"
+                        )
             
             # 检查消息是否已处理且未过期
             if message_id in self.processed_message_ids:
@@ -7301,6 +7377,8 @@ class XianyuLive:
             
             # 标记消息ID为已处理（更新或添加时间戳）
             self.processed_message_ids[message_id] = current_time
+            if image_dedupe_key:
+                self.processed_message_ids[image_dedupe_key] = current_time
             
             # 定期清理过期的消息ID
             if len(self.processed_message_ids) > self.processed_message_ids_max_size:
@@ -7421,14 +7499,6 @@ class XianyuLive:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】自动回复已禁用")
                 return
 
-            # 检查该chat_id是否处于暂停状态
-            if pause_manager.is_chat_paused(chat_id):
-                remaining_time = pause_manager.get_remaining_pause_time(chat_id)
-                remaining_minutes = remaining_time // 60
-                remaining_seconds = remaining_time % 60
-                logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】chat_id {chat_id} 自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
-                return
-
             # 构造用户URL
             user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
 
@@ -7449,6 +7519,14 @@ class XianyuLive:
 
             # 如果API回复失败或未启用API，按新的优先级顺序处理
             if not reply:
+                # API接口不受暂停时间限制；暂停只限制关键词、AI、默认回复等本地自动回复。
+                if pause_manager.is_chat_paused(chat_id):
+                    remaining_time = pause_manager.get_remaining_pause_time(chat_id)
+                    remaining_minutes = remaining_time // 60
+                    remaining_seconds = remaining_time % 60
+                    logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】chat_id {chat_id} 本地自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
+                    return
+
                 # 1. 首先尝试关键词匹配（传入商品ID）
                 reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
                 if reply == "EMPTY_REPLY":
@@ -7915,21 +7993,27 @@ class XianyuLive:
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
                 
-                # 提取图片URL列表（用于传递给AI）
+                # 提取消息内容类型和图片URL列表（用于传递给AI）
+                content_type = None
                 image_urls = []
                 try:
                     if "6" in message_1 and isinstance(message_1["6"], dict):
                         msg_content = message_1["6"]
                         if "3" in msg_content and isinstance(msg_content["3"], dict):
                             content_data = json.loads(msg_content["3"]["5"])
+                            content_type = content_data.get("contentType")
                             # contentType 为 2 表示图片消息
-                            if content_data.get("contentType") == 2:
+                            if content_type == 2:
                                 pics = content_data.get("image", {}).get("pics", [])
                                 image_urls = [pic["url"] for pic in pics if pic.get("url")]
                                 if image_urls:
                                     logger.info(f"【{self.cookie_id}】检测到用户发送的图片: {len(image_urls)} 张")
                 except Exception as img_e:
                     logger.debug(f"提取图片URL失败: {self._safe_str(img_e)}")
+
+                if content_type == 6:
+                    logger.info(f"【{self.cookie_id}】检测到平台安全提醒卡片，跳过自动回复处理: {send_message}")
+                    return
 
             except Exception as e:
                 logger.error(f"提取聊天消息信息失败: {self._safe_str(e)}")

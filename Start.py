@@ -542,8 +542,7 @@ async def main():
             logger.info(f"Cookie详细信息获取成功: {cid}, user_id: {user_id}")
 
             logger.info(f"正在创建异步任务: {cid}")
-            task = loop.create_task(manager._run_xianyu(cid, val, user_id))
-            manager.tasks[cid] = task
+            task = manager._create_cookie_task(cid, val, user_id)
             logger.info(f"启动数据库中的 Cookie 任务: {cid} (用户ID: {user_id})")
             logger.info(f"任务已添加到管理器，当前任务数: {len(manager.tasks)}")
         except Exception as e:
