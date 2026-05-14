@@ -36,6 +36,7 @@ export function Settings() {
   const [showSmtpPassword, setShowSmtpPassword] = useState(false)
   // API Key 显示状态
   const [showApiKey, setShowApiKey] = useState(false)
+  const [showReplySecretKey, setShowReplySecretKey] = useState(false)
   // 密码修改显示状态
   const [showCurrentPassword, setShowCurrentPassword] = useState(false)
   const [showNewPassword, setShowNewPassword] = useState(false)
@@ -334,6 +335,54 @@ export function Settings() {
                   />
                   <span className="switch-slider"></span>
                 </label>
+              </div>
+            </div>
+          </div>
+
+          {/* API Security Settings */}
+          <div className="vben-card">
+            <div className="vben-card-header">
+              <h2 className="vben-card-title">
+                <Key className="w-4 h-4" />
+                接口秘钥
+              </h2>
+            </div>
+            <div className="vben-card-body space-y-4">
+              <div className="input-group">
+                <label className="input-label">QQ回复消息API秘钥</label>
+                <div className="relative">
+                  <input
+                    type={showReplySecretKey ? 'text' : 'password'}
+                    value={settings?.qq_reply_secret_key || ''}
+                    onChange={(e) => setSettings(s => s ? { ...s, qq_reply_secret_key: e.target.value } : null)}
+                    placeholder="xianyu_qq_reply_2024"
+                    className="input-ios w-full pr-20"
+                  />
+                  <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowReplySecretKey(!showReplySecretKey)}
+                      className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                      title={showReplySecretKey ? '隐藏' : '显示'}
+                    >
+                      {showReplySecretKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (settings?.qq_reply_secret_key) {
+                          navigator.clipboard.writeText(settings.qq_reply_secret_key)
+                          addToast({ type: 'success', message: '已复制到剪贴板' })
+                        }
+                      }}
+                      className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                      title="复制"
+                    >
+                      <Copy className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400 mt-1">用于 /send-message 和 /send-image 接口的 api_key 验证</p>
               </div>
             </div>
           </div>

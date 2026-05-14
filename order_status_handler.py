@@ -8,7 +8,6 @@ import json
 import time
 import uuid
 import threading
-import asyncio
 from loguru import logger
 from typing import Optional, Dict, Any
 
@@ -240,7 +239,7 @@ class OrderStatusHandler:
                         logger.error(f"❌ 订单 {order_id} 不存在于数据库中且未启用待处理队列，跳过状态更新")
                     return False
                 
-                current_status = current_order.get('order_status', 'processing')
+                current_status = current_order.get('order_status') or current_order.get('status') or 'processing'
                 logger.info(f"📊 当前订单状态: {current_status}, 目标状态: {new_status}")
                 
                 # 检查是否是相同的状态更新（避免重复处理）
@@ -305,7 +304,7 @@ class OrderStatusHandler:
                 import traceback
                 logger.error(f"详细错误信息: {traceback.format_exc()}")
                 return False
-    
+
     def _is_valid_status_transition(self, current_status: str, new_status: str) -> bool:
         """检查状态转换是否合理
         

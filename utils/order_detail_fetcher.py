@@ -411,18 +411,49 @@ class OrderDetailFetcher:
             logger.info(f"找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
             print(f"🔍 找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
 
-            # 获取金额信息
-            amount_selector = '.boldNum--JgEOXfA3'
-            amount_element = await self.page.query_selector(amount_selector)
             amount = ''
-            if amount_element:
-                amount_text = await amount_element.text_content()
-                if amount_text:
-                    amount = amount_text.strip()
-                    logger.info(f"找到金额: {amount}")
-                    print(f"💰 金额: {amount}")
-                    result['amount'] = amount
-            else:
+            amount_selectors = [
+                '.boldNum--JgEOXfA3',
+                '[class*="boldNum"]',
+                '[class*="price"]',
+                '[class*="Price"]',
+                '[class*="amount"]',
+                '[class*="Amount"]',
+            ]
+            for amount_selector in amount_selectors:
+                amount_elements = await self.page.query_selector_all(amount_selector)
+                for amount_element in amount_elements:
+                    amount_text = await amount_element.text_content()
+                    if amount_text:
+                        amount_match = re.search(r'[¥￥]?\s*\d+(?:\.\d{1,2})?', amount_text.strip())
+                        if amount_match:
+                            amount = amount_match.group(0).strip()
+                            logger.info(f"找到金额: {amount} (selector={amount_selector})")
+                            print(f"💰 金额: {amount}")
+                            result['amount'] = amount
+                            break
+                if amount:
+                    break
+
+            if not amount:
+                try:
+                    page_text = await self.page.inner_text('body')
+                    amount_patterns = [
+                        r'(?:实付款|实付|应付款|应付|合计|总价|订单金额|价格|金额)\s*[:：]?\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)',
+                        r'[¥￥]\s*(\d+(?:\.\d{1,2})?)'
+                    ]
+                    for pattern in amount_patterns:
+                        amount_match = re.search(pattern, page_text)
+                        if amount_match:
+                            amount = amount_match.group(1).strip()
+                            logger.info(f"从页面文本提取金额: {amount}")
+                            print(f"💰 金额: {amount}")
+                            result['amount'] = amount
+                            break
+                except Exception as amount_e:
+                    logger.warning(f"从页面文本提取金额失败: {amount_e}")
+
+            if not amount:
                 logger.warning("未找到金额元素")
                 print("⚠️ 未找到金额信息")
 

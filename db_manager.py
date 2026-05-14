@@ -1200,10 +1200,19 @@ class DBManager:
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
 
-                self._execute_sql(cursor,
-                    "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                    (cookie_id, cookie_value, user_id)
-                )
+                self._execute_sql(cursor, "SELECT id FROM cookies WHERE id = ?", (cookie_id,))
+                exists = cursor.fetchone() is not None
+
+                if exists:
+                    self._execute_sql(cursor,
+                        "UPDATE cookies SET value = ?, user_id = ? WHERE id = ?",
+                        (cookie_value, user_id, cookie_id)
+                    )
+                else:
+                    self._execute_sql(cursor,
+                        "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+                        (cookie_id, cookie_value, user_id)
+                    )
 
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")

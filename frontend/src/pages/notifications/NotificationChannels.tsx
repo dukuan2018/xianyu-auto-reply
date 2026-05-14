@@ -14,7 +14,7 @@ const channelTypes = [
   { type: 'feishu', label: '飞书通知', desc: '飞书机器人消息', icon: Send, placeholder: '{"webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/..."}' },
   { type: 'bark', label: 'Bark通知', desc: 'iOS推送通知', icon: Smartphone, placeholder: '{"device_key": "xxx", "server_url": "https://api.day.app"}' },
   { type: 'email', label: '邮件通知', desc: 'SMTP邮件发送', icon: Mail, placeholder: '{"smtp_server": "...", "smtp_port": 587, "email_user": "...", "email_password": "...", "recipient_email": "..."}' },
-  { type: 'webhook', label: 'Webhook', desc: '自定义HTTP请求', icon: Link, placeholder: '{"webhook_url": "https://..."}' },
+  { type: 'webhook', label: 'Webhook', desc: '自定义HTTP请求', icon: Link, placeholder: '{"webhook_url": "https://...", "payload_format": "json"}' },
   { type: 'wechat', label: '微信通知', desc: '企业微信机器人', icon: MessageCircle, placeholder: '{"webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."}' },
   { type: 'telegram', label: 'Telegram', desc: 'Telegram机器人', icon: Send, placeholder: '{"bot_token": "...", "chat_id": "..."}' },
 ] as const
@@ -196,7 +196,7 @@ export function NotificationChannels() {
       case 'email': return '需要填写SMTP服务器、端口、发送邮箱、密码和接收邮箱'
       case 'wechat': return '请设置企业微信机器人Webhook URL'
       case 'telegram': return '需要填写Bot Token和Chat ID'
-      case 'webhook': return '填写自定义Webhook URL'
+      case 'webhook': return '填写自定义Webhook URL，payload_format 可填 json；event 会区分 message.received、order.pending_payment、order.price_modified、order.pending_ship 等'
       default: return ''
     }
   }
