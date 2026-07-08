@@ -1,0 +1,18 @@
+cd /www/python/xianyu-auto-reply-fix
+
+python3 -m venv venv
+source venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+
+source /www/python/xianyu-auto-reply-fix/venv/bin/activate
+
+playwright install chromium
+playwright install-deps chromium
+
+sudo yum install -y \
+  atk at-spi2-atk cups-libs libdrm libXcomposite libXdamage libXrandr \
+  libxkbcommon pango cairo alsa-lib nss gtk3 libXScrnSaver \
+  xorg-x11-server-Xvfb

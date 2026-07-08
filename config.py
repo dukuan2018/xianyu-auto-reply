@@ -112,7 +112,8 @@ AUTO_REPLY = config.get('AUTO_REPLY', {
     'api': {
         'enabled': True,
         'url': 'http://127.0.0.1:8080/xianyu/reply',
-        'timeout': 10
+        'timeout': 10,
+        'reply_delay': 0
     }
 })
 MANUAL_MODE = config.get('MANUAL_MODE', {})

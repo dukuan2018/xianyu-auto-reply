@@ -7367,6 +7367,16 @@ class XianyuLive:
             logger.error(f"调用API出错: {self._safe_str(e)}")
             return None
 
+    def _get_api_reply_delay(self, api_config: dict) -> float:
+        """获取API回复后的发送延迟秒数，配置值单位为毫秒。"""
+        raw_delay = api_config.get('reply_delay', AUTO_REPLY.get('reply_delay', 0))
+        try:
+            delay_ms = float(raw_delay)
+        except (TypeError, ValueError):
+            logger.warning(f"API回复延迟配置无效: {raw_delay}，已按0毫秒处理")
+            return 0
+        return max(delay_ms, 0) / 1000
+
     async def _handle_message_with_semaphore(self, message_data, websocket):
         """带信号量的消息处理包装器，防止并发任务过多"""
         async with self.message_semaphore:
@@ -7754,13 +7764,16 @@ class XianyuLive:
             reply = None
             # 判断是否启用API回复
             api_config = AUTO_REPLY.get('api', {})
+            is_api_reply = False
             if api_config.get('enabled', False):
                 if api_config.get('send_type') == 'all' or (api_config.get('send_type') == 'img' and any(image_urls)):
                     reply = await self.get_api_reply(
                         msg_time, user_url, send_user_id, send_user_name,
                         item_id, send_message, chat_id,image_urls
                     )
-                    if not reply:
+                    if reply:
+                        is_api_reply = True
+                    else:
                         logger.error(f"[{msg_time}] 【API调用失败】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
 
             # 记录回复来源
@@ -7804,6 +7817,12 @@ class XianyuLive:
 
             # 如果有回复内容，发送消息
             if reply:
+                if is_api_reply:
+                    reply_delay = self._get_api_reply_delay(api_config)
+                    if reply_delay > 0:
+                        logger.info(f"[{msg_time}] 【API回复延迟】已收到接口回复，延迟 {reply_delay * 1000:g} 毫秒后发送消息")
+                        await asyncio.sleep(reply_delay)
+
                 # 检查是否是图片发送标记
                 if reply.startswith("__IMAGE_SEND__"):
                     # 提取图片URL（关键词回复不包含卡券ID）
