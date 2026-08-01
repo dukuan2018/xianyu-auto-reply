@@ -1887,9 +1887,17 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 )
                 
                 if cookies_dict is None:
+                    login_error = (
+                        getattr(slider_instance, 'last_login_error', None)
+                        or '登录失败，未获取到有效Cookie'
+                    )
                     password_login_sessions[session_id]['status'] = 'failed'
-                    password_login_sessions[session_id]['error'] = '登录失败，请检查账号密码是否正确'
-                    log_with_user('error', f"账号密码登录失败: {account_id}", current_user)
+                    password_login_sessions[session_id]['error'] = login_error
+                    log_with_user(
+                        'error',
+                        f"账号密码登录失败: {account_id}，原因: {login_error}",
+                        current_user
+                    )
                     return
                 
                 # 将cookie字典转换为字符串格式

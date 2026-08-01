@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 闲鱼滑块验证 - 增强反检测版本
@@ -241,6 +241,18 @@ class RetryStrategyStats:
 # 全局策略统计实例
 strategy_stats = RetryStrategyStats()
 
+class VerificationFrame:
+    """验证页面包装对象，保留原始Frame API并附加验证链接和截图。"""
+
+    def __init__(self, original_frame, verify_url=None, screenshot_path=None, verification_type="face"):
+        self._original_frame = original_frame
+        self.verify_url = verify_url
+        self.screenshot_path = screenshot_path
+        self.verification_type = verification_type
+
+    def __getattr__(self, name):
+        return getattr(self._original_frame, name)
+
 class XianyuSliderStealth:
     
     def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True):
@@ -251,6 +263,7 @@ class XianyuSliderStealth:
         self.page = None
         self.context = None
         self.playwright = None
+        self.last_login_error = None
         
         # 提取纯用户ID（移除时间戳部分）
         self.pure_user_id = concurrency_manager._extract_pure_user_id(user_id)
@@ -1180,58 +1193,64 @@ class XianyuSliderStealth:
             return t
     
     def _generate_physics_trajectory(self, distance: float):
-        """基于物理加速度模型生成轨迹 - 极速模式
-        
-        优化策略：
-        1. 极少轨迹点（5-8步）：快速完成
-        2. 持续加速：一气呵成，不减速
-        3. 确保超调50%以上：保证滑动到位
-        4. 无回退：单向滑动
+        """生成稳定的人类化轨迹。
+
+        旧实现会把目标距离放大到 2 倍以上，并用 5~8 个点在几毫秒内完成。
+        这会让滑块越过轨道，同时很容易触发平台的异常行为检测。轨迹必须以
+        ``distance`` 为终点，且给页面留出足够时间处理 pointer 事件。
         """
+        distance = max(float(distance), 1.0)
+        steps = random.randint(32, 48)
+        base_delay = random.uniform(0.018, 0.028)
         trajectory = []
-        # 确保超调100%
-        target_distance = distance * random.uniform(2.0, 2.1)  # 超调100-110%
-        
-        # 极少步数（5-8步）
-        steps = random.randint(5, 8)
-        
-        # 极快时间间隔
-        base_delay = random.uniform(0.0002, 0.0005)
-        
-        # 生成轨迹点 - 直线加速
-        for i in range(steps):
-            progress = (i + 1) / steps
-            
-            # 计算当前位置（使用平方加速曲线，越来越快）
-            x = target_distance * (progress ** 1.5)  # 加速曲线
-            
-            # 极小Y轴抖动
-            y = random.uniform(0, 2)
-            
-            # 极短延迟
-            delay = base_delay * random.uniform(0.9, 1.1)
-            
+        previous_x = 0.0
+
+        for index in range(1, steps + 1):
+            progress = index / steps
+            # 前后减速，中段保持较稳定的速度，避免完全笔直的机器轨迹。
+            eased = 3 * progress ** 2 - 2 * progress ** 3
+            if index == steps:
+                x = distance
+            else:
+                jitter = random.uniform(-0.45, 0.45)
+                x = min(distance, max(previous_x + 0.15, distance * eased + jitter))
+
+            y = random.uniform(-1.8, 1.8)
+            delay = base_delay * random.uniform(0.85, 1.25)
+            if progress < 0.12 or progress > 0.88:
+                delay *= random.uniform(1.1, 1.35)
+
             trajectory.append((x, y, delay))
-        
-        logger.info(f"【{self.pure_user_id}】极速模式：{len(trajectory)}步，超调100%+")
+            previous_x = x
+
+        logger.info(
+            f"【{self.pure_user_id}】稳定轨迹：{len(trajectory)}步，"
+            f"目标距离={distance:.2f}px，预计耗时={sum(point[2] for point in trajectory):.2f}秒"
+        )
         return trajectory
     
     def generate_human_trajectory(self, distance: float):
-        """生成人类化滑动轨迹 - 只使用极速物理模型"""
+        """生成人类化滑动轨迹。"""
         try:
-            # 只使用物理加速度模型（移除贝塞尔模型以提高速度和稳定性）
-            logger.info(f"【{self.pure_user_id}】📐 使用极速物理模型生成轨迹")
+            logger.info(f"【{self.pure_user_id}】📐 使用稳定人工轨迹模型")
             trajectory = self._generate_physics_trajectory(distance)
             
-            logger.debug(f"【{self.pure_user_id}】极速模式：一次拖到位，无回退")
+            logger.debug(f"【{self.pure_user_id}】稳定模式：单向拖动到目标位置")
             
             # 保存轨迹数据
             self.current_trajectory_data = {
                 "distance": distance,
-                "model": "physics_fast",
+                "model": "human_steady",
                 "total_steps": len(trajectory),
                 "trajectory_points": trajectory.copy(),
-                "final_left_px": 0,
+                "base_delay": sum(point[2] for point in trajectory) / len(trajectory),
+                "jitter_x_range": [-0.45, 0.45],
+                "jitter_y_range": [-1.8, 1.8],
+                "slow_factor": 1.0,
+                "acceleration_phase": 0.2,
+                "fast_phase": 0.6,
+                "slow_start_ratio": 1.0,
+                "final_left_px": 0.0,
                 "completion_used": False,
                 "completion_steps": 0
             }
@@ -1394,497 +1413,143 @@ class XianyuSliderStealth:
         """模拟人类在验证页面的前置行为 - 极速模式已禁用"""
         # 极速模式：不进行页面行为模拟，直接开始滑动
         pass
-    
+
+    def _find_slider_elements_same_frame(self, fast_mode=False):
+        """在同一个页面上下文中查找完整的滑块组合。
+
+        NC 验证码会同时创建多个 iframe。容器可能先出现在一个 frame，
+        真正的按钮和轨道稍后出现在另一个 frame。按钮、轨道必须在同一
+        frame 中重新配对，不能把两个 frame 的 ElementHandle 拼在一起。
+        """
+        page = getattr(self, "page", None)
+        if page is None:
+            return None, None, None
+
+        button_selectors = (
+            "#nc_1_n1z",
+            ".nc_iconfont",
+            ".btn_slide",
+            "#scratch-captcha-btn",
+            ".scratch-captcha-slider .button",
+        )
+        track_selectors = (
+            "#nc_1_n1t",
+            ".nc_scale",
+            ".nc_1_n1t",
+        )
+        container_selectors = (
+            "#baxia-dialog-content",
+            ".nc-container",
+            ".nc_wrapper",
+            "#nocaptcha",
+            ".scratch-captcha-container",
+        )
+
+        def same_context(left, right):
+            return left is right or left == right
+
+        contexts = []
+        preferred_frame = getattr(self, "_detected_slider_frame", None)
+        if preferred_frame is not None:
+            contexts.append((preferred_frame, "已知验证码Frame"))
+
+        contexts.append((page, "主页面"))
+        try:
+            main_frame = page.main_frame
+            for index, frame in enumerate(page.frames):
+                if same_context(frame, main_frame) or any(
+                    same_context(frame, existing) for existing, _ in contexts
+                ):
+                    continue
+                contexts.append((frame, f"Frame {index}"))
+        except Exception as error:
+            logger.debug(f"【{self.pure_user_id}】获取验证码frame列表失败: {error}")
+
+        poll_count = 1 if fast_mode else 8
+        for poll_index in range(poll_count):
+            for context, context_name in contexts:
+                for button_selector in button_selectors:
+                    try:
+                        button = context.query_selector(button_selector)
+                        if not button or not button.is_visible():
+                            continue
+                        button_box = button.bounding_box()
+                        if not button_box or button_box["width"] <= 0 or button_box["height"] <= 0:
+                            continue
+
+                        for track_selector in track_selectors:
+                            track = context.query_selector(track_selector)
+                            if not track or not track.is_visible():
+                                continue
+                            track_box = track.bounding_box()
+                            if not track_box or track_box["width"] <= 0 or track_box["height"] <= 0:
+                                continue
+
+                            # 过滤容器误匹配和不属于同一滑块的元素。
+                            if button_box["width"] >= track_box["width"]:
+                                logger.debug(
+                                    f"【{self.pure_user_id}】忽略无效滑块组合: "
+                                    f"{context_name}, 按钮宽度={button_box['width']:.0f}px, "
+                                    f"轨道宽度={track_box['width']:.0f}px"
+                                )
+                                continue
+
+                            button_right = button_box["x"] + button_box["width"]
+                            track_right = track_box["x"] + track_box["width"]
+                            if button_right < track_box["x"] - 12 or button_box["x"] > track_right + 12:
+                                continue
+
+                            button_center_y = button_box["y"] + button_box["height"] / 2
+                            track_center_y = track_box["y"] + track_box["height"] / 2
+                            if abs(button_center_y - track_center_y) > max(
+                                24,
+                                button_box["height"] * 2,
+                                track_box["height"] * 2,
+                            ):
+                                continue
+
+                            container = None
+                            for container_selector in container_selectors:
+                                try:
+                                    candidate = context.query_selector(container_selector)
+                                    if candidate and candidate.is_visible():
+                                        container = candidate
+                                        break
+                                except Exception:
+                                    continue
+                            if container is None:
+                                container = button
+
+                            self._detected_slider_frame = None if context is page else context
+                            logger.info(
+                                f"【{self.pure_user_id}】✅ 在{context_name}找到同Frame滑块组合: "
+                                f"按钮 {button_selector}, 轨道 {track_selector}"
+                            )
+                            logger.info(
+                                f"【{self.pure_user_id}】滑块尺寸校验通过: "
+                                f"按钮={button_box['width']:.0f}px, 轨道={track_box['width']:.0f}px"
+                            )
+                            return container, button, track
+                    except Exception as error:
+                        logger.debug(
+                            f"【{self.pure_user_id}】{context_name}查找滑块组合失败: {error}"
+                        )
+
+            if poll_index < poll_count - 1:
+                time.sleep(0.15)
+
+        logger.warning(
+            f"【{self.pure_user_id}】未找到同一Frame中的有效滑块按钮和轨道组合"
+        )
+        return None, None, None
+
     def find_slider_elements(self, fast_mode=False):
         """查找滑块元素（支持在主页面和所有frame中查找）
-        
+
         Args:
             fast_mode: 快速模式，不使用wait_for_selector，减少等待时间（当已确认滑块存在时使用）
         """
-        try:
-            # 快速等待页面稳定（快速模式下跳过）
-            if not fast_mode:
-                time.sleep(0.1)
-            
-            # ===== 【优化】优先在 frames 中快速查找最常见的滑块组合 =====
-            # 根据实际日志，滑块按钮和轨道通常在同一个 frame 中
-            # 按钮: #nc_1_n1z, 轨道: #nc_1_n1t
-            logger.debug(f"【{self.pure_user_id}】优先在frames中快速查找常见滑块组合...")
-            try:
-                frames = self.page.frames
-                for idx, frame in enumerate(frames):
-                    try:
-                        # 优先查找最常见的按钮选择器
-                        button_element = frame.query_selector("#nc_1_n1z")
-                        if button_element and button_element.is_visible():
-                            # 在同一个 frame 中查找轨道
-                            track_element = frame.query_selector("#nc_1_n1t")
-                            if track_element and track_element.is_visible():
-                                # 找到容器（可以用按钮或其他选择器）
-                                container_element = frame.query_selector("#baxia-dialog-content")
-                                if not container_element:
-                                    container_element = frame.query_selector(".nc-container")
-                                if not container_element:
-                                    # 如果找不到容器，用按钮作为容器标识
-                                    container_element = button_element
-                                
-                                logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 快速找到完整滑块组合！")
-                                logger.info(f"【{self.pure_user_id}】  - 按钮: #nc_1_n1z")
-                                logger.info(f"【{self.pure_user_id}】  - 轨道: #nc_1_n1t")
-                                
-                                # 保存frame引用
-                                self._detected_slider_frame = frame
-                                return container_element, button_element, track_element
-                    except Exception as e:
-                        logger.debug(f"【{self.pure_user_id}】Frame {idx} 快速查找失败: {e}")
-                        continue
-            except Exception as e:
-                logger.debug(f"【{self.pure_user_id}】frames 快速查找出错: {e}")
-            
-            # ===== 如果快速查找失败，使用原来的完整查找逻辑 =====
-            logger.debug(f"【{self.pure_user_id}】快速查找未成功，使用完整查找逻辑...")
-            
-            # 定义滑块容器选择器（支持多种类型）
-            container_selectors = [
-                "#nc_1_n1z",  # 滑块按钮也可以作为容器标识
-                "#baxia-dialog-content",
-                ".nc-container",
-                ".nc_wrapper",
-                ".nc_scale",
-                "[class*='nc-container']",
-                # 刮刮乐类型滑块
-                "#nocaptcha",
-                ".scratch-captcha-container",
-                ".scratch-captcha-question-bg",
-                # 通用选择器
-                "[class*='slider']",
-                "[class*='captcha']"
-            ]
-            
-            # 查找滑块容器
-            slider_container = None
-            found_frame = None
-            
-            # 如果检测时已经知道滑块在哪个frame中，直接在该frame中查找
-            if hasattr(self, '_detected_slider_frame'):
-                if self._detected_slider_frame is not None:
-                    # 在已知的frame中查找
-                    logger.info(f"【{self.pure_user_id}】已知滑块在frame中，直接在frame中查找...")
-                    target_frame = self._detected_slider_frame
-                    for selector in container_selectors:
-                        try:
-                            element = target_frame.query_selector(selector)
-                            if element:
-                                try:
-                                    if element.is_visible():
-                                        logger.info(f"【{self.pure_user_id}】在已知Frame中找到滑块容器: {selector}")
-                                        slider_container = element
-                                        found_frame = target_frame
-                                        break
-                                except:
-                                    # 如果无法检查可见性，也尝试使用
-                                    logger.info(f"【{self.pure_user_id}】在已知Frame中找到滑块容器（无法检查可见性）: {selector}")
-                                    slider_container = element
-                                    found_frame = target_frame
-                                    break
-                        except Exception as e:
-                            logger.debug(f"【{self.pure_user_id}】已知Frame选择器 {selector} 未找到: {e}")
-                            continue
-                else:
-                    # _detected_slider_frame 是 None，表示在主页面
-                    logger.info(f"【{self.pure_user_id}】已知滑块在主页面，直接在主页面查找...")
-                    for selector in container_selectors:
-                        try:
-                            element = self.page.wait_for_selector(selector, timeout=1000)
-                            if element:
-                                logger.info(f"【{self.pure_user_id}】在已知主页面找到滑块容器: {selector}")
-                                slider_container = element
-                                found_frame = self.page
-                                break
-                        except Exception as e:
-                            logger.debug(f"【{self.pure_user_id}】主页面选择器 {selector} 未找到: {e}")
-                            continue
-            
-            # 如果已知位置中没找到，或者没有已知位置，先尝试在主页面查找
-            if not slider_container:
-                for selector in container_selectors:
-                    try:
-                        element = self.page.wait_for_selector(selector, timeout=1000)  # 减少超时时间，快速跳过
-                        if element:
-                            logger.info(f"【{self.pure_user_id}】在主页面找到滑块容器: {selector}")
-                            slider_container = element
-                            found_frame = self.page
-                            break
-                    except Exception as e:
-                        logger.debug(f"【{self.pure_user_id}】主页面选择器 {selector} 未找到: {e}")
-                        continue
-            
-            # 如果主页面没找到，在所有frame中查找
-            if not slider_container and self.page:
-                try:
-                    frames = self.page.frames
-                    logger.info(f"【{self.pure_user_id}】主页面未找到滑块，开始在所有frame中查找（共{len(frames)}个frame）...")
-                    for idx, frame in enumerate(frames):
-                        try:
-                            for selector in container_selectors:
-                                try:
-                                    # 在frame中使用query_selector，因为frame可能不支持wait_for_selector
-                                    element = frame.query_selector(selector)
-                                    if element:
-                                        # 检查元素是否可见
-                                        try:
-                                            if element.is_visible():
-                                                logger.info(f"【{self.pure_user_id}】在Frame {idx} 找到滑块容器: {selector}")
-                                                slider_container = element
-                                                found_frame = frame
-                                                break
-                                        except:
-                                            # 如果无法检查可见性，也尝试使用
-                                            logger.info(f"【{self.pure_user_id}】在Frame {idx} 找到滑块容器（无法检查可见性）: {selector}")
-                                            slider_container = element
-                                            found_frame = frame
-                                            break
-                                except Exception as e:
-                                    logger.debug(f"【{self.pure_user_id}】Frame {idx} 选择器 {selector} 未找到: {e}")
-                                    continue
-                            if slider_container:
-                                break
-                        except Exception as e:
-                            logger.debug(f"【{self.pure_user_id}】检查Frame {idx} 时出错: {e}")
-                            continue
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】获取frame列表时出错: {e}")
-            
-            if not slider_container:
-                logger.error(f"【{self.pure_user_id}】未找到任何滑块容器（主页面和所有frame都已检查）")
-                return None, None, None
-            
-            # 定义滑块按钮选择器（支持多种类型）
-            button_selectors = [
-                # nc 系列滑块
-                "#nc_1_n1z",
-                ".nc_iconfont",
-                ".btn_slide",
-                # 刮刮乐类型滑块
-                "#scratch-captcha-btn",
-                ".scratch-captcha-slider .button",
-                # 通用选择器
-                "[class*='slider']",
-                "[class*='btn']",
-                "[role='button']"
-            ]
-            
-            # 查找滑块按钮（在找到容器的同一个frame中查找）
-            slider_button = None
-            search_frame = found_frame if found_frame and found_frame != self.page else self.page
-            
-            # 如果容器是在主页面找到的，按钮也应该在主页面查找
-            # 如果容器是在frame中找到的，按钮也应该在同一个frame中查找
-            for selector in button_selectors:
-                try:
-                    element = None
-                    if fast_mode:
-                        # 快速模式：直接使用 query_selector，不等待
-                        element = search_frame.query_selector(selector)
-                    else:
-                        # 正常模式：使用 wait_for_selector
-                        if search_frame == self.page:
-                            element = self.page.wait_for_selector(selector, timeout=3000)
-                        else:
-                            # 在frame中先尝试wait_for_selector（如果支持）
-                            try:
-                                # 尝试使用wait_for_selector（Playwright的frame支持）
-                                element = search_frame.wait_for_selector(selector, timeout=3000)
-                            except:
-                                # 如果不支持wait_for_selector，使用query_selector并等待
-                                time.sleep(0.5)  # 等待元素加载
-                                element = search_frame.query_selector(selector)
-                    
-                    if element:
-                        # 检查元素是否可见，但不要因为不可见就放弃
-                        try:
-                            is_visible = element.is_visible()
-                            if not is_visible:
-                                logger.debug(f"【{self.pure_user_id}】找到元素但不可见: {selector}，继续尝试其他选择器")
-                                element = None
-                        except Exception as vis_e:
-                            # 如果无法检查可见性，仍然使用该元素
-                            logger.debug(f"【{self.pure_user_id}】无法检查元素可见性: {vis_e}，继续使用该元素")
-                            pass
-                    
-                    if element:
-                        frame_info = "主页面" if search_frame == self.page else f"Frame"
-                        logger.info(f"【{self.pure_user_id}】在{frame_info}找到滑块按钮: {selector}")
-                        slider_button = element
-                        break
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】选择器 {selector} 未找到: {e}")
-                    continue
-            
-            # 如果在找到容器的frame中没找到按钮，尝试在所有frame中查找
-            # 无论容器是在主页面还是frame中找到的，如果按钮找不到，都应该在所有frame中查找
-            if not slider_button:
-                logger.warning(f"【{self.pure_user_id}】在找到容器的位置未找到按钮，尝试在所有frame中查找...")
-                try:
-                    frames = self.page.frames
-                    for idx, frame in enumerate(frames):
-                        # 如果容器是在frame中找到的，跳过已经检查过的frame
-                        if found_frame and found_frame != self.page and frame == found_frame:
-                            continue
-                        # 如果容器是在主页面找到的，跳过主页面（因为已经检查过了）
-                        if found_frame == self.page and frame == self.page:
-                            continue
-                            
-                        for selector in button_selectors:
-                            try:
-                                element = None
-                                if fast_mode:
-                                    # 快速模式：直接使用 query_selector
-                                    element = frame.query_selector(selector)
-                                else:
-                                    # 正常模式：先尝试wait_for_selector
-                                    try:
-                                        element = frame.wait_for_selector(selector, timeout=2000)
-                                    except:
-                                        time.sleep(0.3)  # 等待元素加载
-                                        element = frame.query_selector(selector)
-                                
-                                if element:
-                                    try:
-                                        is_visible = element.is_visible()
-                                        if is_visible:
-                                            logger.info(f"【{self.pure_user_id}】在Frame {idx} 找到滑块按钮: {selector}")
-                                            slider_button = element
-                                            found_frame = frame  # 更新found_frame
-                                            break
-                                        else:
-                                            logger.debug(f"【{self.pure_user_id}】在Frame {idx} 找到元素但不可见: {selector}")
-                                    except:
-                                        # 如果无法检查可见性，仍然使用该元素
-                                        logger.info(f"【{self.pure_user_id}】在Frame {idx} 找到滑块按钮（无法检查可见性）: {selector}")
-                                        slider_button = element
-                                        found_frame = frame  # 更新found_frame
-                                        break
-                            except Exception as e:
-                                logger.debug(f"【{self.pure_user_id}】Frame {idx} 选择器 {selector} 查找失败: {e}")
-                                continue
-                        if slider_button:
-                            break
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】在所有frame中查找按钮时出错: {e}")
-            
-            # 如果还是没找到，尝试在主页面查找（如果之前没在主页面查找过）
-            if not slider_button and found_frame != self.page:
-                logger.warning(f"【{self.pure_user_id}】在所有frame中未找到按钮，尝试在主页面查找...")
-                for selector in button_selectors:
-                    try:
-                        element = None
-                        if fast_mode:
-                            # 快速模式：直接使用 query_selector
-                            element = self.page.query_selector(selector)
-                        else:
-                            # 正常模式：使用 wait_for_selector
-                            element = self.page.wait_for_selector(selector, timeout=2000)
-                        
-                        if element:
-                            try:
-                                if element.is_visible():
-                                    logger.info(f"【{self.pure_user_id}】在主页面找到滑块按钮: {selector}")
-                                    slider_button = element
-                                    found_frame = self.page  # 更新found_frame
-                                    break
-                                else:
-                                    logger.debug(f"【{self.pure_user_id}】在主页面找到元素但不可见: {selector}")
-                            except:
-                                # 如果无法检查可见性，仍然使用该元素
-                                logger.info(f"【{self.pure_user_id}】在主页面找到滑块按钮（无法检查可见性）: {selector}")
-                                slider_button = element
-                                found_frame = self.page  # 更新found_frame
-                                break
-                    except Exception as e:
-                        logger.debug(f"【{self.pure_user_id}】主页面选择器 {selector} 查找失败: {e}")
-                        continue
-            
-            # 如果还是没找到，尝试使用更宽松的查找方式（不检查可见性）
-            if not slider_button:
-                logger.warning(f"【{self.pure_user_id}】使用宽松模式查找滑块按钮（不检查可见性）...")
-                # 先在所有frame中查找
-                try:
-                    frames = self.page.frames
-                    for idx, frame in enumerate(frames):
-                        for selector in button_selectors[:3]:  # 只使用前3个最常用的选择器
-                            try:
-                                element = frame.query_selector(selector)
-                                if element:
-                                    logger.info(f"【{self.pure_user_id}】在Frame {idx} 找到滑块按钮（宽松模式）: {selector}")
-                                    slider_button = element
-                                    found_frame = frame
-                                    break
-                            except:
-                                continue
-                        if slider_button:
-                            break
-                except:
-                    pass
-                
-                # 如果还是没找到，在主页面查找
-                if not slider_button:
-                    for selector in button_selectors[:3]:
-                        try:
-                            element = self.page.query_selector(selector)
-                            if element:
-                                logger.info(f"【{self.pure_user_id}】在主页面找到滑块按钮（宽松模式）: {selector}")
-                                slider_button = element
-                                found_frame = self.page
-                                break
-                        except:
-                            continue
-            
-            if not slider_button:
-                logger.error(f"【{self.pure_user_id}】未找到任何滑块按钮（主页面和所有frame都已检查，包括宽松模式）")
-                return slider_container, None, None
-            
-            # 定义滑块轨道选择器
-            track_selectors = [
-                "#nc_1_n1t",
-                ".nc_scale",
-                ".nc_1_n1t",
-                "[class*='track']",
-                "[class*='scale']"
-            ]
-            
-            # 查找滑块轨道（在找到按钮的同一个frame中查找，因为按钮和轨道应该在同一个位置）
-            slider_track = None
-            # 使用找到按钮的frame来查找轨道
-            track_search_frame = found_frame if found_frame and found_frame != self.page else self.page
-            
-            for selector in track_selectors:
-                try:
-                    element = None
-                    if fast_mode:
-                        # 快速模式：直接使用 query_selector
-                        element = track_search_frame.query_selector(selector)
-                    else:
-                        # 正常模式：使用 wait_for_selector
-                        if track_search_frame == self.page:
-                            element = self.page.wait_for_selector(selector, timeout=3000)
-                        else:
-                            # 在frame中使用query_selector
-                            element = track_search_frame.query_selector(selector)
-                    
-                    if element:
-                        try:
-                            if not element.is_visible():
-                                element = None
-                        except:
-                            pass
-                    
-                    if element:
-                        frame_info = "主页面" if track_search_frame == self.page else f"Frame"
-                        logger.info(f"【{self.pure_user_id}】在{frame_info}找到滑块轨道: {selector}")
-                        slider_track = element
-                        break
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】选择器 {selector} 未找到: {e}")
-                    continue
-            
-            # 如果在找到按钮的frame中没找到轨道，先点击frame激活它，然后再查找
-            if not slider_track and track_search_frame and track_search_frame != self.page:
-                logger.warning(f"【{self.pure_user_id}】在已知Frame中未找到轨道，尝试点击frame激活后再查找...")
-                try:
-                    # 点击frame以激活它，让轨道出现
-                    # 尝试点击frame中的容器或按钮来激活
-                    if slider_container:
-                        try:
-                            slider_container.click(timeout=1000)
-                            logger.info(f"【{self.pure_user_id}】已点击滑块容器以激活frame")
-                            time.sleep(0.3)  # 等待轨道出现
-                        except:
-                            pass
-                    elif slider_button:
-                        try:
-                            slider_button.click(timeout=1000)
-                            logger.info(f"【{self.pure_user_id}】已点击滑块按钮以激活frame")
-                            time.sleep(0.3)  # 等待轨道出现
-                        except:
-                            pass
-                    
-                    # 再次在同一个frame中查找轨道
-                    for selector in track_selectors:
-                        try:
-                            element = track_search_frame.query_selector(selector)
-                            if element:
-                                try:
-                                    if element.is_visible():
-                                        logger.info(f"【{self.pure_user_id}】点击frame后在Frame中找到滑块轨道: {selector}")
-                                        slider_track = element
-                                        break
-                                except:
-                                    # 如果无法检查可见性，也尝试使用
-                                    logger.info(f"【{self.pure_user_id}】点击frame后在Frame中找到滑块轨道（无法检查可见性）: {selector}")
-                                    slider_track = element
-                                    break
-                        except:
-                            continue
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】点击frame后查找轨道时出错: {e}")
-                
-                # 如果点击frame后还是没找到，尝试在所有frame中查找
-                if not slider_track:
-                    logger.warning(f"【{self.pure_user_id}】点击frame后仍未找到轨道，尝试在所有frame中查找...")
-                    try:
-                        frames = self.page.frames
-                        for idx, frame in enumerate(frames):
-                            if frame == track_search_frame:
-                                continue  # 跳过已经检查过的frame
-                            for selector in track_selectors:
-                                try:
-                                    element = frame.query_selector(selector)
-                                    if element:
-                                        try:
-                                            if element.is_visible():
-                                                logger.info(f"【{self.pure_user_id}】在Frame {idx} 找到滑块轨道: {selector}")
-                                                slider_track = element
-                                                break
-                                        except:
-                                            pass
-                                except:
-                                    continue
-                            if slider_track:
-                                break
-                    except Exception as e:
-                        logger.debug(f"【{self.pure_user_id}】在所有frame中查找轨道时出错: {e}")
-            
-            # 如果还是没找到，尝试在主页面查找
-            if not slider_track:
-                logger.warning(f"【{self.pure_user_id}】在所有frame中未找到轨道，尝试在主页面查找...")
-                for selector in track_selectors:
-                    try:
-                        element = self.page.wait_for_selector(selector, timeout=1000)
-                        if element:
-                            logger.info(f"【{self.pure_user_id}】在主页面找到滑块轨道: {selector}")
-                            slider_track = element
-                            break
-                    except:
-                        continue
-            
-            if not slider_track:
-                logger.error(f"【{self.pure_user_id}】未找到任何滑块轨道（主页面和所有frame都已检查）")
-                return slider_container, slider_button, None
-            
-            # 保存找到滑块的frame引用，供后续验证使用
-            if found_frame and found_frame != self.page:
-                self._detected_slider_frame = found_frame
-                logger.info(f"【{self.pure_user_id}】保存滑块frame引用，供后续验证使用")
-            elif found_frame == self.page:
-                # 如果是在主页面找到的，设置为None
-                self._detected_slider_frame = None
-            
-            return slider_container, slider_button, slider_track
-            
-        except Exception as e:
-            logger.error(f"【{self.pure_user_id}】查找滑块元素时出错: {str(e)}")
-            return None, None, None
+        return self._find_slider_elements_same_frame(fast_mode=fast_mode)
     
     def is_scratch_captcha(self):
         """检测是否为刮刮乐类型验证码"""
@@ -1926,42 +1591,17 @@ class XianyuSliderStealth:
             
             # 🎨 检测是否为刮刮乐类型
             is_scratch = self.is_scratch_captcha()
-            
-            # 🔑 关键优化1：使用JavaScript获取更精确的尺寸（避免DPI缩放影响）
-            try:
-                precise_distance = self.page.evaluate("""
-                    () => {
-                        const button = document.querySelector('#nc_1_n1z') || document.querySelector('.nc_iconfont');
-                        const track = document.querySelector('#nc_1_n1t') || document.querySelector('.nc_scale');
-                        if (button && track) {
-                            const buttonRect = button.getBoundingClientRect();
-                            const trackRect = track.getBoundingClientRect();
-                            // 计算实际可滑动距离（考虑padding和边距）
-                            return trackRect.width - buttonRect.width;
-                        }
-                        return null;
-                    }
-                """)
-                
-                if precise_distance and precise_distance > 0:
-                    logger.info(f"【{self.pure_user_id}】使用JavaScript精确计算滑动距离: {precise_distance:.2f}px")
-                    
-                    # 🎨 刮刮乐特殊处理：只滑动75-85%的距离
-                    if is_scratch:
-                        scratch_ratio = random.uniform(0.25, 0.35)
-                        final_distance = precise_distance * scratch_ratio
-                        logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：滑动{scratch_ratio*100:.1f}%距离 ({final_distance:.2f}px)")
-                        return final_distance
-                    
-                    # 🔑 关键优化2：添加微小随机偏移（防止每次都完全相同）
-                    # 真人操作时，滑动距离会有微小偏差
-                    random_offset = random.uniform(-0.5, 0.5)
-                    return precise_distance + random_offset
-            except Exception as e:
-                logger.debug(f"【{self.pure_user_id}】JavaScript精确计算失败，使用后备方案: {e}")
-            
-            # 后备方案：使用bounding_box计算
+
+            # 只使用已经配对的两个 ElementHandle 计算距离，避免在主页面
+            # evaluate 时误取到别的 frame 或别的验证码元素。
             slide_distance = track_box["width"] - button_box["width"]
+            if slide_distance <= 0:
+                logger.error(
+                    f"【{self.pure_user_id}】无效滑块尺寸: "
+                    f"按钮宽度={button_box['width']:.2f}px, "
+                    f"轨道宽度={track_box['width']:.2f}px"
+                )
+                return 0
             
             # 🎨 刮刮乐特殊处理：只滑动75-85%的距离
             if is_scratch:
@@ -1969,9 +1609,11 @@ class XianyuSliderStealth:
                 slide_distance = slide_distance * scratch_ratio
                 logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：滑动{scratch_ratio*100:.1f}%距离 ({slide_distance:.2f}px)")
             else:
-                # 添加微小随机偏移
-                random_offset = random.uniform(-0.5, 0.5)
-                slide_distance += random_offset
+                # 目标距离严格限制在轨道可滑动范围内。
+                slide_distance = min(
+                    max(0.0, slide_distance),
+                    max(0.0, track_box["width"] - button_box["width"]),
+                )
             
             logger.info(f"【{self.pure_user_id}】计算滑动距离: {slide_distance:.2f}px (轨道宽度: {track_box['width']}px, 滑块宽度: {button_box['width']}px)")
             
@@ -1982,118 +1624,57 @@ class XianyuSliderStealth:
             return 0
     
     def check_verification_success_fast(self, slider_button: ElementHandle):
-        """检查验证结果 - 极速模式"""
+        """检查滑块验证结果，兼容验证码 iframe 的异步回调。"""
         try:
-            logger.info(f"【{self.pure_user_id}】检查验证结果（极速模式）...")
-            
-            # 确定滑块所在的frame（如果已知）
-            target_frame = None
-            if hasattr(self, '_detected_slider_frame') and self._detected_slider_frame is not None:
-                target_frame = self._detected_slider_frame
-                logger.info(f"【{self.pure_user_id}】在已知Frame中检查验证结果")
-                # 先检查frame是否还存在（未被分离）
-                try:
-                    # 尝试访问frame的属性来检查是否被分离
-                    _ = target_frame.url if hasattr(target_frame, 'url') else None
-                except Exception as frame_check_error:
-                    error_msg = str(frame_check_error).lower()
-                    # 如果frame被分离（detached），说明验证成功，容器已消失
-                    if 'detached' in error_msg or 'disconnected' in error_msg:
-                        logger.info(f"【{self.pure_user_id}】✓ Frame已被分离，验证成功")
-                        return True
-            else:
-                target_frame = self.page
-                logger.info(f"【{self.pure_user_id}】在主页面检查验证结果")
-            
-            # 等待一小段时间让验证结果出现
-            time.sleep(0.3)
-            
-            # 核心逻辑：首先检查frame容器状态
-            # 如果容器消失，直接返回成功；如果容器还在，检查失败提示
+            target_frame = getattr(self, '_detected_slider_frame', None) or self.page
+            frame_name = "主页面" if target_frame == self.page else "验证码Frame"
+            logger.info(f"【{self.pure_user_id}】在{frame_name}等待滑块验证结果...")
+
             def check_container_status():
-                """检查容器状态，返回(存在, 可见)"""
+                selectors = (
+                    ".nc-container",
+                    "#baxia-dialog-content",
+                    "#nocaptcha",
+                    ".scratch-captcha-container",
+                )
                 try:
-                    if target_frame == self.page:
-                        container = self.page.query_selector(".nc-container")
-                    else:
-                        # 检查frame是否还存在（未被分离）
+                    for selector in selectors:
+                        element = target_frame.query_selector(selector)
+                        if element is None:
+                            continue
                         try:
-                            # 再次检查frame是否被分离
-                            _ = target_frame.url if hasattr(target_frame, 'url') else None
-                            container = target_frame.query_selector(".nc-container")
-                        except Exception as frame_error:
-                            error_msg = str(frame_error).lower()
-                            # 如果frame被分离（detached），说明容器已经不存在
-                            if 'detached' in error_msg or 'disconnected' in error_msg:
-                                logger.info(f"【{self.pure_user_id}】Frame已被分离，容器不存在")
-                                return (False, False)
-                            # 其他错误，继续尝试
-                            raise frame_error
-                    
-                    if container is None:
-                        return (False, False)  # 容器不存在
-                    
-                    try:
-                        is_visible = container.is_visible()
-                        return (True, is_visible)
-                    except Exception as vis_error:
-                        vis_error_msg = str(vis_error).lower()
-                        # 如果元素被分离，说明容器不存在
-                        if 'detached' in vis_error_msg or 'disconnected' in vis_error_msg:
-                            logger.info(f"【{self.pure_user_id}】容器元素已被分离，容器不存在")
-                            return (False, False)
-                        # 无法检查可见性，假设存在且可见
-                        return (True, True)
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    # 如果frame或元素被分离，说明容器不存在
-                    if 'detached' in error_msg or 'disconnected' in error_msg:
-                        logger.info(f"【{self.pure_user_id}】Frame或容器已被分离，容器不存在")
-                        return (False, False)
-                    # 其他错误，保守处理，假设存在
-                    logger.warning(f"【{self.pure_user_id}】检查容器状态时出错: {e}")
-                    return (True, True)
-            
-            # 第一次检查容器状态
-            container_exists, container_visible = check_container_status()
-            
-            # 如果容器不存在或不可见，直接返回成功
-            if not container_exists or not container_visible:
-                logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失（不存在或不可见），验证成功")
-                return True
-            
-            # 容器还在，需要等待更长时间并检查失败提示
-            logger.info(f"【{self.pure_user_id}】滑块容器仍存在且可见，等待验证结果...")
-            time.sleep(1.2)  # 等待验证结果
-            
-            # 再次检查容器状态
-            container_exists, container_visible = check_container_status()
-            
-            # 如果容器消失了，返回成功
-            if not container_exists or not container_visible:
-                logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失，验证成功")
-                return True
-            
-            # 容器还在，检查是否有验证失败提示
-            logger.info(f"【{self.pure_user_id}】滑块容器仍存在，检查验证失败提示...")
-            if self.check_verification_failure():
-                logger.warning(f"【{self.pure_user_id}】检测到验证失败提示，验证失败")
-                return False
-            
-            # 容器还在，但没有失败提示，可能还在验证中或验证失败
-            # 再等待一小段时间后再次检查
-            time.sleep(0.5)
-            container_exists, container_visible = check_container_status()
-            
-            if not container_exists or not container_visible:
-                logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失，验证成功")
-                return True
-            
-            # 容器仍然存在，且没有失败提示，可能是验证失败但没有显示失败提示
-            # 或者验证还在进行中，但为了不无限等待，返回失败
-            logger.warning(f"【{self.pure_user_id}】滑块容器仍存在且可见，且未检测到失败提示，但验证可能失败")
+                            return True, element.is_visible()
+                        except Exception as visibility_error:
+                            error_text = str(visibility_error).lower()
+                            if "detached" in error_text or "disconnected" in error_text:
+                                return False, False
+                            return True, True
+                    return False, False
+                except Exception as frame_error:
+                    error_text = str(frame_error).lower()
+                    if "detached" in error_text or "disconnected" in error_text:
+                        return False, False
+                    logger.debug(f"【{self.pure_user_id}】检查滑块容器失败: {frame_error}")
+                    return True, True
+
+            deadline = time.time() + 6.0
+            while time.time() < deadline:
+                container_exists, container_visible = check_container_status()
+                if not container_exists or not container_visible:
+                    logger.info(f"【{self.pure_user_id}】✓ 滑块容器已消失，验证成功")
+                    return True
+
+                if self.check_verification_failure(target_frame):
+                    logger.warning(f"【{self.pure_user_id}】检测到滑块验证失败提示")
+                    return False
+
+                time.sleep(0.4)
+
+            logger.warning(
+                f"【{self.pure_user_id}】滑块容器在等待窗口内仍可见，"
+                "且没有明确成功状态，判定本次失败"
+            )
             return False
-            
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】检查验证结果时出错: {str(e)}")
             return False
@@ -2125,82 +1706,90 @@ class XianyuSliderStealth:
             logger.warning(f"【{self.pure_user_id}】检查页面改变时出错: {e}")
             return False
     
-    def check_verification_failure(self):
-        """检查验证失败提示"""
+    def check_verification_failure(self, target_frame=None):
+        """检查验证码 frame 中的明确失败提示。
+
+        不能把 ``.nc-container`` 或 ``.nc_wrapper`` 当成失败提示，因为验证
+        失败时容器通常仍然存在，验证进行中也同样存在。
+        """
         try:
-            logger.info(f"【{self.pure_user_id}】检查验证失败提示...")
-            
-            # 等待一下让失败提示出现（由于调用前已经等待了，这里等待时间缩短）
-            time.sleep(1.5)
-            
-            # 检查页面内容中是否包含验证失败相关文字
-            page_content = self.page.content()
-            failure_keywords = [
+            frames = [target_frame] if target_frame is not None else [self.page] + list(self.page.frames)
+            failure_keywords = (
                 "验证失败",
-                "点击框体重试", 
-                "重试",
-                "失败",
+                "点击框体重试",
                 "请重试",
                 "验证码错误",
-                "滑动验证失败"
-            ]
-            
-            found_failure = False
-            for keyword in failure_keywords:
-                if keyword in page_content:
-                    logger.info(f"【{self.pure_user_id}】页面内容包含失败关键词: {keyword}")
-                    found_failure = True
-                    break
-            
-            if found_failure:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败关键词，验证失败")
-                return True
-            
-            # 检查各种可能的验证失败提示元素
-            failure_selectors = [
-                "text=验证失败，点击框体重试",
+                "滑动验证失败",
+                "请重新验证",
+            )
+            failure_selectors = (
                 "text=验证失败",
-                "text=点击框体重试", 
-                "text=重试",
-                ".nc-lang-cnt",
+                "text=点击框体重试",
+                "text=验证码错误",
                 "[class*='retry']",
                 "[class*='fail']",
-                "[class*='error']",
                 ".captcha-tips",
-                "#captcha-loading",
-                ".nc_1_nocaptcha",
-                ".nc_wrapper",
-                ".nc-container"
-            ]
-            
-            retry_button = None
-            for selector in failure_selectors:
-                try:
-                    element = self.page.query_selector(selector)
-                    if element and element.is_visible():
-                        # 获取元素文本内容
-                        element_text = ""
-                        try:
-                            element_text = element.text_content()
-                        except:
-                            pass
-                        
-                        logger.info(f"【{self.pure_user_id}】找到验证失败提示: {selector}, 文本: {element_text}")
-                        retry_button = element
-                        break
-                except:
+            )
+
+            for frame in frames:
+                if frame is None:
                     continue
-            
-            if retry_button:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败提示元素，验证失败")
-                return True
-            else:
-                logger.info(f"【{self.pure_user_id}】未找到验证失败提示，可能验证成功了")
-                return False
-                
-        except Exception as e:
-            logger.error(f"【{self.pure_user_id}】检查验证失败时出错: {e}")
+                try:
+                    content = frame.content()
+                    for keyword in failure_keywords:
+                        if keyword in content:
+                            logger.info(f"【{self.pure_user_id}】验证码页面包含失败关键词: {keyword}")
+                            return True
+                except Exception:
+                    pass
+
+                for selector in failure_selectors:
+                    try:
+                        element = frame.query_selector(selector)
+                        if element and element.is_visible():
+                            text = ""
+                            try:
+                                text = element.inner_text()
+                            except Exception:
+                                pass
+                            logger.info(
+                                f"【{self.pure_user_id}】找到验证码失败提示: "
+                                f"{selector}, 文本: {text}"
+                            )
+                            return True
+                    except Exception:
+                        continue
+
             return False
+        except Exception as e:
+            logger.debug(f"【{self.pure_user_id}】检查验证失败提示时出错: {e}")
+            return False
+
+    def _wait_for_manual_login(self, page, max_wait_time=450, check_interval=5):
+        """有头模式下保留浏览器，等待用户手动完成平台验证。"""
+        logger.warning(
+            f"【{self.pure_user_id}】自动滑块验证未通过，保留有头浏览器，"
+            f"等待人工完成验证（最多{max_wait_time}秒）"
+        )
+        deadline = time.time() + max_wait_time
+        while time.time() < deadline:
+            try:
+                if self._check_login_success_by_element(page):
+                    self._captcha_manual_required = False
+                    logger.success(f"【{self.pure_user_id}】人工验证完成，登录状态已确认")
+                    return True
+            except Exception as error:
+                logger.debug(f"【{self.pure_user_id}】检查人工验证状态失败: {error}")
+
+            remaining = max(0, int(deadline - time.time()))
+            logger.info(
+                f"【{self.pure_user_id}】等待人工验证完成，剩余约{remaining}秒"
+            )
+            time.sleep(min(check_interval, max(1, remaining)))
+
+        logger.error(f"【{self.pure_user_id}】人工验证等待超时")
+        self.last_login_error = "平台滑块验证未通过，人工验证等待超时"
+        return False
     
     def _analyze_failure(self, attempt: int, slide_distance: float, trajectory_data: dict):
         """分析失败原因并记录"""
@@ -2226,34 +1815,30 @@ class XianyuSliderStealth:
             return {}
     
     def solve_slider(self, max_retries: int = 3, fast_mode: bool = False):
-        """处理滑块验证（极速模式）
+        """处理滑块验证。
         
         Args:
-            max_retries: 最大重试次数（默认3次，因为同一个页面连续失败3次后就不会成功了）
-            fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
+            max_retries: 最大重试次数
+            fast_mode: 快速查找模式（当已确认滑块存在时使用）
         """
         failure_records = []
-        current_strategy = 'ultra_fast'  # 极速策略
+        current_strategy = 'steady'
         
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
                 
-                # 如果不是第一次尝试，短暂等待后重试
+                # 验证失败后页面通常会重建验证码 iframe。不能复用旧 frame
+                # 或旧 ElementHandle，否则下一轮很容易拿不到按钮位置。
                 if attempt > 1:
-                    retry_delay = random.uniform(0.5, 1.0)  # 减少等待时间
+                    retry_delay = random.uniform(0.8, 1.5)
                     logger.info(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
                     time.sleep(retry_delay)
-                    
-                    # 不刷新页面，直接在原来的frame中重试
-                    # 保留frame引用，让重试时可以直接使用原来的frame查找滑块
                     if hasattr(self, '_detected_slider_frame'):
-                        frame_info = "主页面" if self._detected_slider_frame is None else "Frame"
-                        logger.info(f"【{self.pure_user_id}】保留frame引用，将在原来的{frame_info}中重试")
-                    else:
-                        logger.info(f"【{self.pure_user_id}】未找到frame引用，将重新检测滑块位置")
+                        delattr(self, '_detected_slider_frame')
+                    logger.info(f"【{self.pure_user_id}】重新扫描页面和全部验证码Frame")
                 
-                # 1. 查找滑块元素（使用快速模式）
+                # 每一轮都重新获取按钮和轨道，避免使用失效的元素引用。
                 slider_container, slider_button, slider_track = self.find_slider_elements(fast_mode=fast_mode)
                 if not all([slider_container, slider_button, slider_track]):
                     logger.error(f"【{self.pure_user_id}】滑块元素查找失败")
@@ -2276,9 +1861,9 @@ class XianyuSliderStealth:
                     logger.error(f"【{self.pure_user_id}】滑动模拟失败")
                     continue
                 
-                # 5. 检查验证结果（极速模式）
+                # 5. 检查验证结果
                 if self.check_verification_success_fast(slider_button):
-                    logger.info(f"【{self.pure_user_id}】✅ 滑块验证成功! (第{attempt}次尝试)")
+                    logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功! (第{attempt}次尝试)")
                     
                     # 📊 记录策略成功
                     strategy_stats.record_attempt(attempt, current_strategy, success=True)
@@ -2318,6 +1903,9 @@ class XianyuSliderStealth:
                 if attempt < max_retries:
                     continue
         
+        if hasattr(self, '_detected_slider_frame'):
+            delattr(self, '_detected_slider_frame')
+
         # 所有尝试都失败了
         logger.error(f"【{self.pure_user_id}】滑块验证失败，已尝试{max_retries}次")
         
@@ -2415,39 +2003,75 @@ class XianyuSliderStealth:
             bool: 登录成功返回True，否则返回False
         """
         try:
-            # 检查目标元素
-            selector = '.rc-virtual-list-holder-inner'
             logger.info(f"【{self.pure_user_id}】========== 检查登录状态（通过页面元素） ==========")
-            logger.info(f"【{self.pure_user_id}】检查选择器: {selector}")
-            
-            # 查找元素
-            element = page.query_selector(selector)
-            
-            if element:
-                # 获取元素的子元素数量
-                child_count = element.evaluate('el => el.children.length')
-                inner_html = element.inner_html()
-                inner_text = element.inner_text() if element.is_visible() else ""
-                
-                logger.info(f"【{self.pure_user_id}】找到目标元素:")
-                logger.info(f"【{self.pure_user_id}】  - 子元素数量: {child_count}")
-                logger.info(f"【{self.pure_user_id}】  - 是否可见: {element.is_visible()}")
-                logger.info(f"【{self.pure_user_id}】  - innerText长度: {len(inner_text)}")
-                logger.info(f"【{self.pure_user_id}】  - innerHTML长度: {len(inner_html)}")
-                
-                # 判断是否有数据：子元素数量大于0
-                if child_count > 0:
-                    logger.success(f"【{self.pure_user_id}】✅ 登录成功！检测到列表有 {child_count} 个子元素")
-                    logger.info(f"【{self.pure_user_id}】================================================")
-                    return True
-                else:
-                    logger.debug(f"【{self.pure_user_id}】列表为空，登录未完成")
-                    logger.info(f"【{self.pure_user_id}】================================================")
-                    return False
-            else:
-                logger.debug(f"【{self.pure_user_id}】未找到目标元素: {selector}")
-                logger.info(f"【{self.pure_user_id}】================================================")
-                return False
+
+            frames = [page] + list(page.frames)
+            current_url = (getattr(page, 'url', '') or '').lower()
+
+            # 先检查明确成功信号。人工验证完成后，登录 iframe 可能短时间
+            # 仍残留在 DOM 里；如果先看到 iframe 就返回失败，会造成已登录
+            # 但等待循环继续提示。
+            for frame in frames:
+                try:
+                    element = frame.query_selector('.rc-virtual-list-holder-inner')
+                    if not element or not element.is_visible():
+                        continue
+                    child_count = element.evaluate('el => el.children.length')
+                    logger.info(
+                        f"【{self.pure_user_id}】找到消息列表，子元素数量: {child_count}"
+                    )
+                    if child_count > 0:
+                        logger.success(f"【{self.pure_user_id}】✅ 登录成功！")
+                        return True
+                except Exception:
+                    continue
+
+            if 'goofish.com' in current_url and '/im' in current_url:
+                try:
+                    cookies = self.context.cookies() if self.context else page.context.cookies()
+                    cookie_names = {cookie.get('name') for cookie in cookies}
+                    if 'unb' in cookie_names or 'sgcookie' in cookie_names:
+                        logger.success(
+                            f"【{self.pure_user_id}】✅ 当前已在IM页面，检测到认证Cookie"
+                        )
+                        return True
+                except Exception as cookie_error:
+                    logger.debug(f"【{self.pure_user_id}】备用Cookie判定失败: {cookie_error}")
+
+            login_selectors = (
+                '#fm-login-id',
+                '#fm-login-password',
+                'button.password-login',
+            )
+            login_frame_urls = (
+                'mini_login',
+                'newlogin',
+                'action=captcha',
+            )
+
+            # 只要登录表单、登录 iframe 或验证码 frame 仍存在，就不能判定成功。
+            for frame in frames:
+                try:
+                    frame_url = (getattr(frame, 'url', '') or '').lower()
+                    if any(marker in frame_url for marker in login_frame_urls):
+                        logger.debug(
+                            f"【{self.pure_user_id}】登录状态未完成，仍存在登录/验证Frame: "
+                            f"{getattr(frame, 'url', '')}"
+                        )
+                        return False
+                    for selector in login_selectors:
+                        element = frame.query_selector(selector)
+                        if element and element.is_visible():
+                            logger.debug(
+                                f"【{self.pure_user_id}】登录状态未完成，仍存在元素: {selector}"
+                            )
+                            return False
+                except Exception:
+                    continue
+
+            logger.info(f"【{self.pure_user_id}】未确认登录成功")
+            logger.info(f"【{self.pure_user_id}】================================================")
+            return False
                 
         except Exception as e:
             logger.debug(f"【{self.pure_user_id}】检查登录状态时出错: {e}")
@@ -2558,20 +2182,17 @@ class XianyuSliderStealth:
                                     logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
                                     time.sleep(3)  # 等待滑块验证后的状态更新
                                 else:
-                                    # 3次失败后，刷新页面重试
-                                    logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
-                                    try:
-                                        self.page.reload(wait_until="domcontentloaded", timeout=30000)
-                                        logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
-                                        time.sleep(2)
-                                        slider_success = self.solve_slider(max_retries=3)
-                                        if not slider_success:
-                                            logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
-                                        else:
-                                            logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块验证成功！")
-                                            time.sleep(3)
-                                    except Exception as e:
-                                        logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
+                                    # 平台已明确返回验证失败时，不再自动刷新并重复触发
+                                    # 风控。无头模式直接失败，有头模式交给人工完成。
+                                    self._captcha_manual_required = True
+                                    self.last_login_error = (
+                                        "平台滑块验证未通过，"
+                                        "请在有头浏览器中人工完成验证后重试"
+                                    )
+                                    logger.error(
+                                        f"【{self.pure_user_id}】滑块验证连续失败，"
+                                        "停止自动刷新，避免继续触发平台风控"
+                                    )
                                 
                                 # 清理临时变量
                                 if hasattr(self, '_detected_slider_frame'):
@@ -2601,77 +2222,19 @@ class XianyuSliderStealth:
                                 face_verify_url = self._get_face_verification_url(frame)
                                 if face_verify_url:
                                     logger.info(f"【{self.pure_user_id}】✅ 获取到人脸验证链接: {face_verify_url}")
-                                    
-                                    # 截图并保存
-                                    screenshot_path = None
-                                    try:
-                                        # 等待页面加载完成
-                                        time.sleep(2)
-                                        
-                                        # 先删除该账号的旧截图
-                                        import glob
-                                        screenshots_dir = "static/uploads/images"
-                                        os.makedirs(screenshots_dir, exist_ok=True)
-                                        old_screenshots = glob.glob(os.path.join(screenshots_dir, f"face_verify_{self.pure_user_id}_*.jpg"))
-                                        for old_file in old_screenshots:
-                                            try:
-                                                os.remove(old_file)
-                                                logger.info(f"【{self.pure_user_id}】删除旧的验证截图: {old_file}")
-                                            except Exception as e:
-                                                logger.warning(f"【{self.pure_user_id}】删除旧截图失败: {e}")
-                                        
-                                        # 尝试截取iframe元素的截图
-                                        screenshot_bytes = None
-                                        try:
-                                            # 获取iframe元素并截图
-                                            iframe_element = page.query_selector('iframe#alibaba-login-box')
-                                            if iframe_element:
-                                                screenshot_bytes = iframe_element.screenshot()
-                                                logger.info(f"【{self.pure_user_id}】已截取iframe元素")
-                                            else:
-                                                # 如果找不到iframe，截取整个页面
-                                                screenshot_bytes = page.screenshot(full_page=False)
-                                                logger.info(f"【{self.pure_user_id}】已截取整个页面")
-                                        except Exception as e:
-                                            logger.warning(f"【{self.pure_user_id}】截取iframe失败，尝试截取整个页面: {e}")
-                                            screenshot_bytes = page.screenshot(full_page=False)
-                                        
-                                        if screenshot_bytes:
-                                            # 生成带时间戳的文件名并直接保存
-                                            from datetime import datetime
-                                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                                            filename = f"face_verify_{self.pure_user_id}_{timestamp}.jpg"
-                                            file_path = os.path.join(screenshots_dir, filename)
-                                            
-                                            try:
-                                                with open(file_path, 'wb') as f:
-                                                    f.write(screenshot_bytes)
-                                                # 返回相对路径
-                                                screenshot_path = file_path.replace('\\', '/')
-                                                logger.info(f"【{self.pure_user_id}】✅ 人脸验证截图已保存: {screenshot_path}")
-                                            except Exception as e:
-                                                logger.error(f"【{self.pure_user_id}】保存截图失败: {e}")
-                                                screenshot_path = None
-                                        else:
-                                            logger.warning(f"【{self.pure_user_id}】⚠️ 截图失败，无法获取截图数据")
-                                    except Exception as e:
-                                        logger.error(f"【{self.pure_user_id}】截图时出错: {e}")
-                                        import traceback
-                                        logger.debug(traceback.format_exc())
-                                    
-                                    # 创建一个特殊的frame对象，包含截图路径
-                                    class VerificationFrame:
-                                        def __init__(self, original_frame, verify_url, screenshot_path=None):
-                                            self._original_frame = original_frame
-                                            self.verify_url = verify_url
-                                            self.screenshot_path = screenshot_path
-                                        
-                                        def __getattr__(self, name):
-                                            return getattr(self._original_frame, name)
-                                    
-                                    return True, VerificationFrame(frame, face_verify_url, screenshot_path)
+                                    screenshot_path = self._save_face_verification_screenshot(page, frame)
+                                    return True, VerificationFrame(
+                                        frame,
+                                        face_verify_url,
+                                        screenshot_path,
+                                        "face",
+                                    )
                                 
-                                return True, frame
+                                logger.warning(
+                                    f"【{self.pure_user_id}】alibaba-login-box 中未找到人脸验证入口，"
+                                    "不把登录二维码当做人脸验证"
+                                )
+                                continue
                     except Exception as e:
                         logger.debug(f"【{self.pure_user_id}】检查iframe时出错: {e}")
                         continue
@@ -2697,9 +2260,26 @@ class XianyuSliderStealth:
                                 continue
                         
                         if not is_slider:
-                            logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到 mini_login 页面（人脸验证/短信验证）")
-                            logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame URL: {frame_url}")
-                            return True, frame
+                            if self._is_face_verification_frame(frame):
+                                logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到人脸验证页面")
+                                logger.info(f"【{self.pure_user_id}】人脸验证Frame URL: {frame_url}")
+                                screenshot_path = self._save_face_verification_screenshot(page, frame)
+                                return True, VerificationFrame(frame, frame_url, screenshot_path, "face")
+
+                            face_verify_url = self._get_face_verification_url(frame)
+                            if face_verify_url:
+                                logger.info(
+                                    f"【{self.pure_user_id}】✅ 在mini_login中切换到人脸验证: "
+                                    f"{face_verify_url}"
+                                )
+                                screenshot_path = self._save_face_verification_screenshot(page, frame)
+                                return True, VerificationFrame(frame, face_verify_url, screenshot_path, "face")
+
+                            logger.warning(
+                                f"【{self.pure_user_id}】Frame {idx} 是普通mini_login登录页，"
+                                "未发现人脸识别入口，跳过登录二维码"
+                            )
+                            continue
                     
                     # 检查frame的父iframe是否是alibaba-login-box
                     try:
@@ -2708,9 +2288,16 @@ class XianyuSliderStealth:
                         if frame_element:
                             parent_iframe_id = frame_element.get_attribute('id')
                             if parent_iframe_id == 'alibaba-login-box':
-                                logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到 alibaba-login-box（人脸验证/短信验证）")
-                                logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame URL: {frame_url}")
-                                return True, frame
+                                if self._is_face_verification_frame(frame):
+                                    logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到 alibaba-login-box 人脸验证")
+                                    logger.info(f"【{self.pure_user_id}】人脸验证Frame URL: {frame_url}")
+                                    screenshot_path = self._save_face_verification_screenshot(page, frame)
+                                    return True, VerificationFrame(frame, frame_url, screenshot_path, "face")
+                                logger.debug(
+                                    f"【{self.pure_user_id}】Frame {idx} 属于alibaba-login-box，"
+                                    "但不是人脸验证，跳过"
+                                )
+                                continue
                     except:
                         pass
                     
@@ -2758,9 +2345,24 @@ class XianyuSliderStealth:
                                         continue
                                 
                                 if not has_slider_in_frame:
+                                    if self._is_plain_login_qr_frame(frame):
+                                        logger.warning(
+                                            f"【{self.pure_user_id}】Frame {idx} 检测到普通登录二维码，"
+                                            "不作为人脸验证返回"
+                                        )
+                                        continue
+                                    if self._is_face_verification_frame(frame):
+                                        logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到人脸识别二维码: {selector}")
+                                        logger.info(f"【{self.pure_user_id}】人脸验证Frame URL: {frame_url}")
+                                        screenshot_path = self._save_face_verification_screenshot(page, frame)
+                                        return True, VerificationFrame(frame, frame_url, screenshot_path, "face")
                                     logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到二维码验证: {selector}")
                                     logger.info(f"【{self.pure_user_id}】二维码Frame URL: {frame_url}")
-                                    return True, frame
+                                    logger.warning(
+                                        f"【{self.pure_user_id}】该二维码没有人脸验证特征，"
+                                        "按要求跳过，避免发送登录二维码"
+                                    )
+                                    continue
                         except:
                             continue
                     
@@ -2783,7 +2385,8 @@ class XianyuSliderStealth:
                             if not has_slider_keyword:
                                 logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到人脸验证")
                                 logger.info(f"【{self.pure_user_id}】人脸验证Frame URL: {frame_url}")
-                                return True, frame
+                                screenshot_path = self._save_face_verification_screenshot(page, frame)
+                                return True, VerificationFrame(frame, frame_url, screenshot_path, "face")
                     except:
                         pass
                         
@@ -2797,11 +2400,109 @@ class XianyuSliderStealth:
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】检测二维码/人脸验证时出错: {e}")
             return False, None
+
+    def _get_frame_text(self, frame) -> str:
+        """尽量读取frame可见文本，用于区分登录二维码和人脸验证。"""
+        try:
+            return frame.inner_text("body")
+        except TypeError:
+            try:
+                return frame.inner_text("body", timeout=1000)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            return frame.content()
+        except Exception:
+            return ""
+
+    def _is_face_verification_frame(self, frame) -> bool:
+        text = self._get_frame_text(frame)
+        frame_url = getattr(frame, "url", "") or ""
+        face_keywords = [
+            "人脸", "脸部", "刷脸", "面部", "拍摄脸部",
+            "实人认证", "身份认证", "身份验证"
+        ]
+        return any(keyword in text or keyword in frame_url for keyword in face_keywords)
+
+    def _is_plain_login_qr_frame(self, frame) -> bool:
+        """判断是否只是普通登录二维码，避免误发给用户做人脸验证。"""
+        if self._is_face_verification_frame(frame):
+            return False
+
+        text = self._get_frame_text(frame)
+        frame_url = getattr(frame, "url", "") or ""
+        login_qr_keywords = [
+            "扫码登录", "扫码安全登录", "手机扫码", "密码登录",
+            "账号登录", "淘宝账号登录", "闲鱼APP扫码", "使用手机"
+        ]
+        return "mini_login" in frame_url or any(keyword in text for keyword in login_qr_keywords)
+
+    def _save_face_verification_screenshot(self, page, frame):
+        """保存人脸验证截图；如果当前仍是普通登录二维码则拒绝保存。"""
+        try:
+            time.sleep(2)
+
+            if self._is_plain_login_qr_frame(frame):
+                logger.warning(
+                    f"【{self.pure_user_id}】当前frame仍是普通登录二维码，"
+                    "不保存为人脸验证截图"
+                )
+                return None
+
+            import glob
+            screenshots_dir = "static/uploads/images"
+            os.makedirs(screenshots_dir, exist_ok=True)
+            old_screenshots = glob.glob(
+                os.path.join(screenshots_dir, f"face_verify_{self.pure_user_id}_*.jpg")
+            )
+            for old_file in old_screenshots:
+                try:
+                    os.remove(old_file)
+                    logger.info(f"【{self.pure_user_id}】删除旧的人脸验证截图: {old_file}")
+                except Exception as e:
+                    logger.warning(f"【{self.pure_user_id}】删除旧截图失败: {e}")
+
+            screenshot_bytes = None
+            try:
+                iframe_element = page.query_selector('iframe#alibaba-login-box')
+                if iframe_element:
+                    screenshot_bytes = iframe_element.screenshot()
+                    logger.info(f"【{self.pure_user_id}】已截取人脸验证iframe")
+                else:
+                    screenshot_bytes = page.screenshot(full_page=False)
+                    logger.info(f"【{self.pure_user_id}】已截取整页人脸验证截图")
+            except Exception as e:
+                logger.warning(f"【{self.pure_user_id}】截取iframe失败，尝试截取整页: {e}")
+                screenshot_bytes = page.screenshot(full_page=False)
+
+            if not screenshot_bytes:
+                logger.warning(f"【{self.pure_user_id}】⚠️ 截图失败，无法获取截图数据")
+                return None
+
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"face_verify_{self.pure_user_id}_{timestamp}.jpg"
+            file_path = os.path.join(screenshots_dir, filename)
+            with open(file_path, 'wb') as f:
+                f.write(screenshot_bytes)
+
+            screenshot_path = file_path.replace('\\', '/')
+            logger.info(f"【{self.pure_user_id}】✅ 人脸验证截图已保存: {screenshot_path}")
+            return screenshot_path
+        except Exception as e:
+            logger.error(f"【{self.pure_user_id}】保存人脸验证截图时出错: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
     
     def _get_face_verification_url(self, frame) -> str:
         """在alibaba-login-box frame中，点击'其他验证方式'，然后找到'通过拍摄脸部'的验证按钮，获取链接"""
         try:
             logger.info(f"【{self.pure_user_id}】开始查找人脸验证链接...")
+            original_url = frame.url if hasattr(frame, 'url') else ""
             
             # 等待frame加载完成
             time.sleep(2)
@@ -2833,70 +2534,123 @@ class XianyuSliderStealth:
             
             # 查找"通过拍摄脸部"相关的验证按钮，获取href并点击按钮
             face_verify_url = None
+            face_button_clicked = False
             
             # 方法1: 使用JavaScript精确查找，获取href并点击按钮（根据HTML结构：li > div.desc包含"通过 拍摄脸部" + a.ui-button包含"立即验证"）
             try:
-                href = frame.evaluate("""
+                result = frame.evaluate("""
                     () => {
-                        // 查找所有li元素
-                        const listItems = document.querySelectorAll('li');
-                        for (let li of listItems) {
-                            // 查找包含"通过 拍摄脸部"或"通过拍摄脸部"的desc div，但不能包含"手机"
-                            const descDiv = li.querySelector('div.desc');
-                            if (descDiv && !descDiv.innerText.includes('手机') && (descDiv.innerText.includes('通过 拍摄脸部') || descDiv.innerText.includes('通过拍摄脸部') || descDiv.innerText.includes('拍摄脸部'))) {
-                                // 在同一li中查找"立即验证"按钮
-                                const verifyButton = li.querySelector('a.ui-button, a.ui-button-small, button');
-                                if (verifyButton && verifyButton.innerText && verifyButton.innerText.includes('立即验证')) {
-                                    // 获取按钮的href属性
-                                    const href = verifyButton.href || verifyButton.getAttribute('href') || null;
-                                    // 点击按钮
-                                    verifyButton.click();
-                                    // 返回href
-                                    return href;
-                                }
+                        const faceKeywords = ['通过 拍摄脸部', '通过拍摄脸部', '拍摄脸部', '人脸', '刷脸', '面部', '实人认证'];
+                        const excludeKeywords = ['手机验证码', '短信', '邮箱'];
+                        const nodes = Array.from(document.querySelectorAll('li, div, section, a, button'));
+                        for (const node of nodes) {
+                            const text = (node.innerText || '').replace(/\\s+/g, '');
+                            if (!text) continue;
+                            if (!faceKeywords.some(k => text.includes(k.replace(/\\s+/g, '')))) continue;
+                            if (excludeKeywords.some(k => text.includes(k))) continue;
+
+                            const scope =
+                                node.closest('li') ||
+                                node.closest('[class*="item"]') ||
+                                node.closest('[class*="verify"]') ||
+                                node;
+
+                            const buttons = Array.from(scope.querySelectorAll('a, button'));
+                            const button =
+                                buttons.find(btn => /立即验证|验证|开始|认证|去/.test(btn.innerText || '')) ||
+                                (node.matches('a,button') ? node : null) ||
+                                buttons[0];
+
+                            if (button) {
+                                const href = button.href || button.getAttribute('href') || null;
+                                button.click();
+                                return { href, clicked: true, text };
                             }
                         }
-                        return null;
+
+                        const xpathResult = document.evaluate(
+                            "//*[contains(text(),'拍摄脸部') or contains(text(),'人脸') or contains(text(),'刷脸')]",
+                            document,
+                            null,
+                            XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+                            null
+                        );
+                        for (let i = 0; i < xpathResult.snapshotLength; i++) {
+                            const node = xpathResult.snapshotItem(i);
+                            const scope = node.closest('li') || node.parentElement;
+                            if (!scope) continue;
+                            const button = scope.querySelector('a,button');
+                            if (button) {
+                                const href = button.href || button.getAttribute('href') || null;
+                                button.click();
+                                return { href, clicked: true, text: node.innerText || '' };
+                            }
+                        }
+
+                        return { href: null, clicked: false, text: '' };
                     }
                 """)
-                if href:
-                    face_verify_url = href
-                    logger.info(f"【{self.pure_user_id}】通过JavaScript找到'通过拍摄脸部'验证按钮的href并已点击: {face_verify_url}")
+                if result:
+                    href = result.get('href') if isinstance(result, dict) else result
+                    face_button_clicked = bool(result.get('clicked')) if isinstance(result, dict) else bool(href)
+                    if href:
+                        face_verify_url = href
+                        logger.info(f"【{self.pure_user_id}】通过JavaScript找到人脸验证按钮href并已点击: {face_verify_url}")
+                    elif face_button_clicked:
+                        logger.info(f"【{self.pure_user_id}】通过JavaScript点击了人脸验证按钮，但未获得href")
             except Exception as e:
                 logger.debug(f"【{self.pure_user_id}】方法1（JavaScript）查找失败: {e}")
             
             # 方法2: 如果方法1失败，使用Playwright API查找并点击
-            if not face_verify_url:
+            if not face_verify_url and not face_button_clicked:
                 try:
                     # 查找所有li元素
                     list_items = frame.query_selector_all('li')
                     for li in list_items:
                         try:
-                            # 查找desc div
-                            desc_div = li.query_selector('div.desc')
-                            if desc_div:
-                                desc_text = desc_div.inner_text()
-                                if '手机' not in desc_text and ('通过 拍摄脸部' in desc_text or '通过拍摄脸部' in desc_text or '拍摄脸部' in desc_text):
-                                    logger.info(f"【{self.pure_user_id}】找到'通过拍摄脸部'选项（方法2）")
-                                    # 在同一li中查找验证按钮
-                                    verify_button = li.query_selector('a.ui-button, a.ui-button-small, button')
-                                    if verify_button:
-                                        button_text = verify_button.inner_text()
-                                        if '立即验证' in button_text:
-                                            # 获取按钮的href属性
-                                            href = verify_button.get_attribute('href')
-                                            if href:
-                                                face_verify_url = href
-                                                logger.info(f"【{self.pure_user_id}】找到'通过拍摄脸部'验证按钮的href: {face_verify_url}")
-                                                # 点击按钮
-                                                logger.info(f"【{self.pure_user_id}】点击'立即验证'按钮...")
-                                                verify_button.click()
-                                                logger.info(f"【{self.pure_user_id}】已点击'立即验证'按钮")
-                                                break
+                            li_text = li.inner_text()
+                            normalized_text = li_text.replace(" ", "")
+                            if (
+                                '手机验证码' not in normalized_text
+                                and '短信' not in normalized_text
+                                and (
+                                    '通过拍摄脸部' in normalized_text
+                                    or '拍摄脸部' in normalized_text
+                                    or '人脸' in normalized_text
+                                    or '刷脸' in normalized_text
+                                    or '面部' in normalized_text
+                                )
+                            ):
+                                logger.info(f"【{self.pure_user_id}】找到人脸验证选项（方法2）")
+                                verify_button = li.query_selector('a.ui-button, a.ui-button-small, a, button')
+                                if verify_button:
+                                    href = verify_button.get_attribute('href')
+                                    if href:
+                                        face_verify_url = href
+                                        logger.info(f"【{self.pure_user_id}】找到人脸验证按钮href: {face_verify_url}")
+                                    logger.info(f"【{self.pure_user_id}】点击人脸验证按钮...")
+                                    verify_button.click()
+                                    face_button_clicked = True
+                                    logger.info(f"【{self.pure_user_id}】已点击人脸验证按钮")
+                                    break
                         except:
                             continue
                 except Exception as e:
                     logger.debug(f"【{self.pure_user_id}】方法2查找失败: {e}")
+
+            if face_button_clicked:
+                time.sleep(3)
+                try:
+                    current_url = frame.url if hasattr(frame, 'url') else ""
+                    if not face_verify_url and current_url and current_url != original_url:
+                        face_verify_url = current_url
+                        logger.info(f"【{self.pure_user_id}】点击人脸验证后frame URL变化: {face_verify_url}")
+                except Exception:
+                    pass
+
+                if not face_verify_url and self._is_face_verification_frame(frame):
+                    face_verify_url = frame.url if hasattr(frame, 'url') else original_url
+                    logger.info(f"【{self.pure_user_id}】点击后页面已包含人脸验证特征: {face_verify_url}")
             
             if face_verify_url:
                 # 如果是相对路径，转换为绝对路径
@@ -2909,8 +2663,11 @@ class XianyuSliderStealth:
                 
                 return face_verify_url
             else:
-                logger.warning(f"【{self.pure_user_id}】未找到人脸验证链接，返回原始frame URL")
-                return frame.url if hasattr(frame, 'url') else None
+                logger.warning(
+                    f"【{self.pure_user_id}】未找到明确的人脸验证链接，"
+                    "不返回原始mini_login登录URL"
+                )
+                return None
                 
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】获取人脸验证链接时出错: {e}")
@@ -2931,14 +2688,20 @@ class XianyuSliderStealth:
             dict: Cookie字典，失败返回None
         """
         try:
+            self.last_login_error = None
+            self.show_browser = bool(show_browser)
+            self._captcha_manual_required = False
+
             # 检查日期有效性
             if not self._check_date_validity():
                 logger.error(f"【{self.pure_user_id}】日期验证失败，无法执行登录")
+                self.last_login_error = "日期验证失败"
                 return None
             
             # 验证必需参数
             if not account or not password:
                 logger.error(f"【{self.pure_user_id}】账号或密码不能为空")
+                self.last_login_error = "账号或密码不能为空"
                 return None
             
             browser_mode = "有头" if show_browser else "无头"
@@ -3183,20 +2946,18 @@ class XianyuSliderStealth:
                             slider_success = self.solve_slider(max_retries=3)
                             
                             if not slider_success:
-                                # 3次失败后，刷新页面重试
-                                logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
-                                try:
-                                    page.reload(wait_until="domcontentloaded", timeout=30000)
-                                    logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
-                                    time.sleep(2)
-                                    slider_success = self.solve_slider(max_retries=3)
-                                    if not slider_success:
-                                        logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
-                                        return None
-                                    else:
-                                        logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块验证成功！")
-                                except Exception as e:
-                                    logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
+                                self._captcha_manual_required = True
+                                self.last_login_error = (
+                                    "平台滑块验证未通过，"
+                                    "请在有头浏览器中人工完成验证后重试"
+                                )
+                                logger.error(
+                                    f"【{self.pure_user_id}】滑块验证连续失败，"
+                                    "停止自动刷新，避免继续触发平台风控"
+                                )
+                                if show_browser:
+                                    slider_success = self._wait_for_manual_login(page)
+                                if not slider_success:
                                     return None
                             else:
                                 logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
@@ -3387,8 +3148,13 @@ class XianyuSliderStealth:
                 self.playwright = playwright
                 
                 try:
-                    # 检查页面内容是否包含滑块相关元素
-                    page_content = page.content()
+                    try:
+                        page.wait_for_load_state('domcontentloaded', timeout=5000)
+                    except Exception as wait_error:
+                        logger.debug(
+                            f"【{self.pure_user_id}】登录后页面仍在跳转，继续用元素检测: {wait_error}"
+                        )
+
                     has_slider = False
                     
                     # 检测滑块元素
@@ -3418,20 +3184,18 @@ class XianyuSliderStealth:
                         if slider_success:
                             logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
                         else:
-                            # 3次失败后，刷新页面重试
-                            logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
-                            try:
-                                page.reload(wait_until="domcontentloaded", timeout=30000)
-                                logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
-                                time.sleep(2)
-                                slider_success = self.solve_slider(max_retries=3)
-                                if not slider_success:
-                                    logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
-                                    return None
-                                else:
-                                    logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块验证成功！")
-                            except Exception as e:
-                                logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
+                            self._captcha_manual_required = True
+                            self.last_login_error = (
+                                "平台滑块验证未通过，"
+                                "请在有头浏览器中人工完成验证后重试"
+                            )
+                            logger.error(
+                                f"【{self.pure_user_id}】滑块验证连续失败，"
+                                "停止自动刷新，避免继续触发平台风控"
+                            )
+                            if show_browser:
+                                slider_success = self._wait_for_manual_login(page)
+                            if not slider_success:
                                 return None
                     else:
                         logger.info(f"【{self.pure_user_id}】未检测到滑块验证")
@@ -3461,21 +3225,18 @@ class XianyuSliderStealth:
                             logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
                             time.sleep(3)  # 等待滑块验证后的状态更新
                         else:
-                            # 3次失败后，刷新页面重试
-                            logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
-                            try:
-                                page.reload(wait_until="domcontentloaded", timeout=30000)
-                                logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
-                                time.sleep(2)
-                                slider_success = self.solve_slider(max_retries=3)
-                                if not slider_success:
-                                    logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
-                                    return None
-                                else:
-                                    logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块验证成功！")
-                                    time.sleep(3)
-                            except Exception as e:
-                                logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
+                            self._captcha_manual_required = True
+                            self.last_login_error = (
+                                "平台滑块验证未通过，"
+                                "请在有头浏览器中人工完成验证后重试"
+                            )
+                            logger.error(
+                                f"【{self.pure_user_id}】滑块验证连续失败，"
+                                "停止自动刷新，避免继续触发平台风控"
+                            )
+                            if show_browser:
+                                slider_success = self._wait_for_manual_login(page)
+                            if not slider_success:
                                 return None
                     
                     # 检查登录状态
@@ -3502,8 +3263,20 @@ class XianyuSliderStealth:
                         logger.info(f"【{self.pure_user_id}】检测是否需要二维码/人脸验证...")
                         has_qr, qr_frame = self._detect_qr_code_verification(page)
                         
+                        if getattr(self, "_captcha_manual_required", False):
+                            if show_browser:
+                                login_success = self._wait_for_manual_login(page)
+                                if not login_success:
+                                    return None
+                            else:
+                                logger.error(
+                                    f"【{self.pure_user_id}】无头模式无法人工完成平台验证，"
+                                    "停止继续刷新登录页面"
+                                )
+                                return None
+
                         # 如果检测到滑块并已处理，再次检查登录状态
-                        if not has_qr:
+                        if not has_qr and not login_success:
                             # 滑块可能已被处理，再次检查登录状态
                             logger.info(f"【{self.pure_user_id}】等待1秒后再次检查登录状态...")
                             time.sleep(1)
@@ -3701,22 +3474,25 @@ class XianyuSliderStealth:
                                                 except Exception as reload_err:
                                                     logger.warning(f"【{self.pure_user_id}】⚠️ 页面刷新失败: {reload_err}")
                                             else:
-                                                # 3次都失败了，刷新页面后再尝试一次
-                                                logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理3次都失败，刷新页面后重试...")
-                                                try:
-                                                    logger.info(f"【{self.pure_user_id}】🔄 刷新页面以重置滑块状态...")
-                                                    page.reload(wait_until="domcontentloaded", timeout=30000)
-                                                    logger.info(f"【{self.pure_user_id}】✅ 页面刷新完成")
-                                                    time.sleep(2)
-                                                    
-                                                    # 刷新后再次尝试处理滑块（给一次机会）
-                                                    logger.info(f"【{self.pure_user_id}】🔄 页面刷新后，再次尝试处理滑块...")
-                                                    if self.solve_slider(max_retries=3, fast_mode=True):
-                                                        logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块处理成功！")
-                                                    else:
-                                                        logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块处理仍然失败，继续等待...")
-                                                except Exception as reload_err:
-                                                    logger.warning(f"【{self.pure_user_id}】⚠️ 页面刷新失败: {reload_err}")
+                                                self._captcha_manual_required = True
+                                                self.last_login_error = (
+                                                    "平台滑块验证未通过，"
+                                                    "请在有头浏览器中人工完成验证后重试"
+                                                )
+                                                logger.error(
+                                                    f"【{self.pure_user_id}】滑块验证连续失败，"
+                                                    "停止自动刷新，等待人工验证"
+                                                )
+                                                if show_browser:
+                                                    login_success = self._wait_for_manual_login(
+                                                        page,
+                                                        max_wait_time=max_wait_time - waited_time,
+                                                        check_interval=check_interval,
+                                                    )
+                                                    if login_success:
+                                                        break
+                                                else:
+                                                    break
                                         except Exception as slider_err:
                                             logger.warning(f"【{self.pure_user_id}】⚠️ 滑块处理出错: {slider_err}")
                                             logger.debug(traceback.format_exc())
@@ -3766,6 +3542,10 @@ class XianyuSliderStealth:
                             login_success = self._check_login_success_by_element(page)
                             if not login_success:
                                 logger.error(f"【{self.pure_user_id}】❌ 登录状态未确认，无法获取Cookie")
+                                self.last_login_error = (
+                                    "登录状态未确认：普通登录页面未提供可用的人脸验证入口，"
+                                    "且未获得认证Cookie"
+                                )
                                 return None
                             else:
                                 logger.success(f"【{self.pure_user_id}】✅ 登录状态已确认")
@@ -3832,6 +3612,7 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】密码登录流程异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            self.last_login_error = str(e) or "密码登录流程异常"
             return None
     
     def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
