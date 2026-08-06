@@ -14,7 +14,7 @@ AUTO_REPLY:
     host: 0.0.0.0  # 绑定所有网络接口，支持IP访问
     port: 8090     # Web服务端口
     reply_delay: 3000  # API返回回复后，延迟发送消息的毫秒数
-    timeout: 10
+    timeout: 30
     url: https://console.yidaw.cn/prod-api/lxz/xianyuReply  # 本地自动回复接口地址
   default_message: 亲爱的"{send_user_name}" 老板你好！所有宝贝都可以拍，秒发货的哈~不满意的话可以直接申请退款哈~
   enabled: true

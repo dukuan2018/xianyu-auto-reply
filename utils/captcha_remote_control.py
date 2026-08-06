@@ -6,6 +6,7 @@
 import asyncio
 import base64
 import json
+import time
 from typing import Optional, Dict, Any
 from loguru import logger
 from playwright.async_api import Page
@@ -17,6 +18,8 @@ class CaptchaRemoteController:
     def __init__(self):
         self.active_sessions: Dict[str, Dict[str, Any]] = {}
         self.websocket_connections: Dict[str, Any] = {}
+        self.session_ttl_seconds = 10 * 60
+        self.completed_ttl_seconds = 60
     
     async def create_session(self, session_id: str, page: Page) -> Dict[str, str]:
         """
@@ -29,6 +32,11 @@ class CaptchaRemoteController:
         Returns:
             包含会话信息的字典
         """
+        await self.cleanup_expired_sessions()
+
+        if session_id in self.active_sessions:
+            await self.close_session(session_id)
+
         # 获取滑块元素位置
         captcha_info = await self._get_captcha_info(page)
         
@@ -46,12 +54,16 @@ class CaptchaRemoteController:
             viewport = {'width': 1280, 'height': 720}  # 默认值
         
         # 存储会话
+        current_time = time.time()
         self.active_sessions[session_id] = {
             'page': page,
             'screenshot': screenshot_base64,
             'captcha_info': captcha_info,
             'completed': False,
-            'viewport': viewport
+            'viewport': viewport,
+            'created_at': current_time,
+            'updated_at': current_time,
+            'completed_at': None
         }
         
         logger.info(f"✅ 创建远程控制会话: {session_id}")
@@ -163,8 +175,10 @@ class CaptchaRemoteController:
             return None
         
         try:
-            page = self.active_sessions[session_id]['page']
-            captcha_info = self.active_sessions[session_id].get('captcha_info')
+            session_data = self.active_sessions[session_id]
+            session_data['updated_at'] = time.time()
+            page = session_data['page']
+            captcha_info = session_data.get('captcha_info')
             
             # 截取整个验证码容器
             if captcha_info and 'x' in captcha_info:
@@ -212,6 +226,7 @@ class CaptchaRemoteController:
             return False
         
         try:
+            self.active_sessions[session_id]['updated_at'] = time.time()
             page = self.active_sessions[session_id]['page']
             
             if event_type == 'down':
@@ -308,6 +323,8 @@ class CaptchaRemoteController:
             # 所有检查都通过，认为验证完成
             logger.success(f"✅ 验证完成（所有滑块元素已消失）: {session_id}")
             self.active_sessions[session_id]['completed'] = True
+            self.active_sessions[session_id]['completed_at'] = time.time()
+            self.active_sessions[session_id]['screenshot'] = None
             return True
             
         except Exception as e:
@@ -327,9 +344,37 @@ class CaptchaRemoteController:
     
     async def close_session(self, session_id: str):
         """关闭会话"""
-        if session_id in self.active_sessions:
-            del self.active_sessions[session_id]
+        session_data = self.active_sessions.pop(session_id, None)
+        if session_data:
+            session_data['screenshot'] = None
+            session_data['page'] = None
+            ws = self.websocket_connections.pop(session_id, None)
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
             logger.info(f"🔒 关闭远程控制会话: {session_id}")
+
+    async def cleanup_expired_sessions(self):
+        """清理过期或已完成的远程控制会话，避免长期持有Page和截图引用。"""
+        now = time.time()
+        expired_session_ids = []
+
+        for session_id, session_data in list(self.active_sessions.items()):
+            updated_at = session_data.get('updated_at') or session_data.get('created_at') or now
+            completed_at = session_data.get('completed_at')
+            if session_data.get('completed') and completed_at and now - completed_at > self.completed_ttl_seconds:
+                expired_session_ids.append(session_id)
+            elif now - updated_at > self.session_ttl_seconds:
+                expired_session_ids.append(session_id)
+
+        for session_id in expired_session_ids:
+            await self.close_session(session_id)
+
+        if expired_session_ids:
+            logger.warning(f"清理过期远程控制会话 {len(expired_session_ids)} 个")
+        return len(expired_session_ids)
     
     async def auto_refresh_screenshot(self, session_id: str, interval: float = 1.0):
         """自动刷新截图（优化版：按需更新）"""
@@ -365,4 +410,3 @@ class CaptchaRemoteController:
 
 # 全局实例
 captcha_controller = CaptchaRemoteController()
-

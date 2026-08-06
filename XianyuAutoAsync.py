@@ -168,11 +168,11 @@ class XianyuLive:
     # 记录订单详情锁的使用时间
     _order_detail_lock_times = {}
 
-    # 商品详情缓存（24小时有效）
+    # 商品详情缓存（6小时有效）
     _item_detail_cache = {}  # {item_id: {'detail': str, 'timestamp': float, 'access_time': float}}
     _item_detail_cache_lock = asyncio.Lock()
-    _item_detail_cache_max_size = 1000  # 最大缓存1000个商品
-    _item_detail_cache_ttl = 24 * 60 * 60  # 24小时TTL
+    _item_detail_cache_max_size = 300  # 最大缓存300个商品，避免长期运行占用过多内存
+    _item_detail_cache_ttl = 6 * 60 * 60  # 6小时TTL
 
     # 类级别的实例管理字典，用于API调用
     _instances = {}  # {cookie_id: XianyuLive实例}
@@ -181,7 +181,7 @@ class XianyuLive:
     # 类级别消息去重：防止同一个账号被意外启动多个监听实例时重复处理同一条消息
     _global_processed_message_ids = {}
     _global_processed_message_ids_lock = asyncio.Lock()
-    _global_processed_message_ids_max_size = 50000
+    _global_processed_message_ids_max_size = 10000
     
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
@@ -530,6 +530,11 @@ class XianyuLive:
             import shutil
             import glob
             import subprocess
+
+            if os.name == 'nt':
+                killed_count = await self._cleanup_playwright_processes_windows()
+                if killed_count > 0:
+                    logger.warning(f"【{self.cookie_id}】Windows Playwright残留进程清理完成: {killed_count} 个")
             
             # ========== 1. 清理残留的 Playwright 进程 ==========
             # 查找运行超过5分钟的 playwright/driver/node 进程并杀死
@@ -610,6 +615,68 @@ class XianyuLive:
                 
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】清理Playwright缓存时出错: {self._safe_str(e)}")
+
+    async def _cleanup_playwright_processes_windows(self, min_age_seconds: int = 300) -> int:
+        """清理Windows下残留的Playwright相关进程。"""
+        if os.name != 'nt':
+            return 0
+
+        try:
+            import psutil
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】psutil不可用，跳过Windows进程清理: {self._safe_str(e)}")
+            return 0
+
+        current_pid = os.getpid()
+        current_time = time.time()
+        keywords = ('playwright', 'ms-playwright', 'playwright/driver', 'playwright\\driver')
+
+        def matches(proc) -> bool:
+            try:
+                name = (proc.info.get('name') or '').lower()
+                cmdline = ' '.join(proc.info.get('cmdline') or []).lower()
+                exe = (proc.info.get('exe') or '').lower()
+                create_time = proc.info.get('create_time') or current_time
+                if current_time - create_time < min_age_seconds:
+                    return False
+                haystack = ' '.join([name, cmdline, exe])
+                return any(keyword in haystack for keyword in keywords)
+            except Exception:
+                return False
+
+        try:
+            candidates = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'exe', 'create_time']):
+                if proc.info.get('pid') == current_pid:
+                    continue
+                if matches(proc):
+                    candidates.append(proc)
+
+            if not candidates:
+                return 0
+
+            for proc in candidates:
+                try:
+                    for child in proc.children(recursive=True):
+                        try:
+                            child.terminate()
+                        except Exception:
+                            pass
+                    proc.terminate()
+                except Exception:
+                    pass
+
+            gone, alive = psutil.wait_procs(candidates, timeout=2)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+            return len(gone) + len(alive)
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】清理Windows Playwright进程时出错: {self._safe_str(e)}")
+            return 0
 
     async def _cleanup_old_logs(self, retention_days: int = 7):
         """清理过期的日志文件
@@ -788,7 +855,7 @@ class XianyuLive:
         # 消息去重机制：防止同一条消息被处理多次
         self.processed_message_ids = {}  # 存储已处理的消息ID和时间戳 {message_id: timestamp}
         self.processed_message_ids_lock = asyncio.Lock()  # 消息ID去重的锁
-        self.processed_message_ids_max_size = 10000  # 最大保存10000个消息ID，防止内存泄漏
+        self.processed_message_ids_max_size = 3000  # 最大保存3000个消息ID，防止内存泄漏
         self.message_expire_time = 3600  # 消息过期时间（秒），默认1小时后可以重复回复
 
         # 初始化订单状态处理器
@@ -5797,6 +5864,16 @@ class XianyuLive:
                         raise
                     except Exception as qr_clean_e:
                         logger.warning(f"【{self.cookie_id}】清理QR登录会话时出错: {qr_clean_e}")
+
+                    # 清理远程验证码会话，释放截图和Playwright Page引用
+                    try:
+                        from utils.captcha_remote_control import captcha_controller
+                        await captcha_controller.cleanup_expired_sessions()
+                        await asyncio.sleep(0)  # 让出控制权，允许检查取消信号
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as captcha_clean_e:
+                        logger.warning(f"【{self.cookie_id}】清理远程验证码会话时出错: {captcha_clean_e}")
                     
                     # 清理Playwright浏览器临时文件和缓存（每5分钟检查一次）
                     try:
@@ -7182,7 +7259,8 @@ class XianyuLive:
         try:
             async with websockets.connect(
                 self.base_url,
-                extra_headers=headers
+                extra_headers=headers,
+                max_queue=256
             ) as websocket:
                 await self._handle_websocket_connection(websocket, toid, item_id, text)
         except TypeError as e:
@@ -7194,7 +7272,8 @@ class XianyuLive:
                 # 使用兼容模式，通过subprotocols传递部分头信息
                 async with websockets.connect(
                     self.base_url,
-                    additional_headers=headers
+                    additional_headers=headers,
+                    max_queue=256
                 ) as websocket:
                     await self._handle_websocket_connection(websocket, toid, item_id, text)
             else:
@@ -7216,7 +7295,7 @@ class XianyuLive:
                 ping_interval=self.heartbeat_interval,
                 ping_timeout=self.heartbeat_timeout,
                 close_timeout=3,
-                max_queue=1024
+                max_queue=256
             )
         except Exception as e:
             # 捕获所有异常类型，不仅仅是TypeError
@@ -7233,7 +7312,7 @@ class XianyuLive:
                         ping_interval=self.heartbeat_interval,
                         ping_timeout=self.heartbeat_timeout,
                         close_timeout=3,
-                        max_queue=1024
+                        max_queue=256
                     )
                 except Exception as e2:
                     error_msg2 = self._safe_str(e2)
@@ -7247,7 +7326,7 @@ class XianyuLive:
                             ping_interval=self.heartbeat_interval,
                             ping_timeout=self.heartbeat_timeout,
                             close_timeout=3,
-                            max_queue=1024
+                            max_queue=256
                         )
                     else:
                         raise e2
@@ -7322,7 +7401,7 @@ class XianyuLive:
                 await self.create_session()
 
             api_config = AUTO_REPLY.get('api', {})
-            timeout = aiohttp.ClientTimeout(total=api_config.get('timeout', 10))
+            timeout = aiohttp.ClientTimeout(total=api_config.get('timeout', 30))
 
             payload = {
                 "cookie_id": self.cookie_id,

@@ -104,6 +104,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 'message': '验证成功！'
                             })
                             logger.success(f"✅ 验证完成: {session_id}")
+                            await captcha_controller.close_session(session_id)
                             break
                         else:
                             # 更新截图显示验证结果
@@ -133,6 +134,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 })
                 
                 if completed:
+                    await captcha_controller.close_session(session_id)
                     break
             
             elif msg_type == 'ping':
@@ -162,6 +164,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 @router.get("/sessions")
 async def get_active_sessions():
     """获取所有活跃的验证会话"""
+    await captcha_controller.cleanup_expired_sessions()
     sessions = []
     for session_id, data in captcha_controller.active_sessions.items():
         sessions.append({
@@ -179,6 +182,7 @@ async def get_active_sessions():
 @router.get("/session/{session_id}")
 async def get_session_info(session_id: str):
     """获取指定会话的信息"""
+    await captcha_controller.cleanup_expired_sessions()
     if session_id not in captcha_controller.active_sessions:
         raise HTTPException(status_code=404, detail="会话不存在")
     
@@ -196,6 +200,7 @@ async def get_session_info(session_id: str):
 @router.get("/screenshot/{session_id}")
 async def get_screenshot(session_id: str):
     """获取最新截图"""
+    await captcha_controller.cleanup_expired_sessions()
     screenshot = await captcha_controller.update_screenshot(session_id)
     
     if not screenshot:
@@ -255,6 +260,7 @@ async def get_captcha_status(session_id: str):
     用于前端轮询检查验证是否完成
     """
     try:
+        await captcha_controller.cleanup_expired_sessions()
         is_completed = captcha_controller.is_completed(session_id)
         session_exists = captcha_controller.session_exists(session_id)
         
@@ -315,4 +321,3 @@ async def captcha_control_page_with_session(session_id: str):
             return HTMLResponse(content=html_content)
     else:
         raise HTTPException(status_code=404, detail="前端页面不存在")
-
