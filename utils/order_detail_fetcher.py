@@ -44,6 +44,7 @@ class OrderDetailFetcher:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self.playwright = None
         self.headless = headless  # 保存headless设置
 
         # 请求头配置
@@ -75,7 +76,7 @@ class OrderDetailFetcher:
 
             logger.info(f"开始初始化浏览器，headless模式: {headless}")
 
-            playwright = await async_playwright().start()
+            self.playwright = await async_playwright().start()
 
             # 启动浏览器（Docker环境优化）
             browser_args = [
@@ -137,7 +138,7 @@ class OrderDetailFetcher:
                 ])
 
             logger.info(f"启动浏览器，参数: {browser_args}")
-            self.browser = await playwright.chromium.launch(
+            self.browser = await self.playwright.chromium.launch(
                 headless=headless,
                 args=browser_args
             )
@@ -173,6 +174,7 @@ class OrderDetailFetcher:
             
         except Exception as e:
             logger.error(f"浏览器初始化失败: {e}")
+            await self._force_close_browser()
             return False
 
     async def _set_cookies(self):
@@ -258,13 +260,14 @@ class OrderDetailFetcher:
                         return result
                     else:
                         logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                        print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
+                        print(f"⚠️ 订单 {order_id} 金额无效，本次放弃获取详情...")
 
-                # 只有在数据库中没有有效数据时才初始化浏览器
-                logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
-                print(f"🔍 订单 {order_id} 开始浏览器获取详情...")
+                logger.info(
+                    f"订单 {order_id} 未获取到有效金额，按策略放弃，"
+                    "不访问订单详情页面"
+                )
+                return None
 
-                # 确保浏览器准备就绪
                 if not await self._ensure_browser_ready():
                     logger.error("浏览器初始化失败，无法获取订单详情")
                     return None
@@ -656,6 +659,13 @@ class OrderDetailFetcher:
                     pass
                 self.browser = None
 
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except:
+                    pass
+                self.playwright = None
+
         except Exception as e:
             logger.debug(f"强制关闭浏览器过程中的异常（可忽略）: {e}")
 
@@ -668,11 +678,18 @@ class OrderDetailFetcher:
                 await self.context.close()
             if self.browser:
                 await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
             logger.info("浏览器已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器失败: {e}")
             # 如果正常关闭失败，尝试强制关闭
             await self._force_close_browser()
+        finally:
+            self.page = None
+            self.context = None
+            self.browser = None
+            self.playwright = None
 
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -761,8 +778,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
 
     fetcher = OrderDetailFetcher(cookie_string, headless)
     try:
-        if await fetcher.init_browser(headless=headless):
-            return await fetcher.fetch_order_detail(order_id)
+        return await fetcher.fetch_order_detail(order_id)
     finally:
         await fetcher.close()
     return None

@@ -1768,7 +1768,7 @@ class XianyuSliderStealth:
     def _wait_for_manual_login(self, page, max_wait_time=450, check_interval=5):
         """有头模式下保留浏览器，等待用户手动完成平台验证。"""
         logger.warning(
-            f"【{self.pure_user_id}】自动滑块验证未通过，保留有头浏览器，"
+            f"【{self.pure_user_id}】需要人工完成平台验证，保留有头浏览器，"
             f"等待人工完成验证（最多{max_wait_time}秒）"
         )
         deadline = time.time() + max_wait_time
@@ -1788,7 +1788,7 @@ class XianyuSliderStealth:
             time.sleep(min(check_interval, max(1, remaining)))
 
         logger.error(f"【{self.pure_user_id}】人工验证等待超时")
-        self.last_login_error = "平台滑块验证未通过，人工验证等待超时"
+        self.last_login_error = "平台验证未完成，人工验证等待超时"
         return False
     
     def _analyze_failure(self, attempt: int, slide_distance: float, trajectory_data: dict):
@@ -1992,6 +1992,45 @@ class XianyuSliderStealth:
             logger.debug(f"【{self.pure_user_id}】析构函数清理时出错: {e}")
     
     # ==================== Playwright 登录辅助方法 ====================
+
+    def _get_context_pages(self, page):
+        """获取当前浏览器上下文中的全部页面，兼容单页和弹窗验证场景。"""
+        pages = []
+        try:
+            context = self.context or getattr(page, "context", None)
+            if context:
+                pages.extend(context.pages)
+        except Exception:
+            pass
+
+        if page not in pages:
+            pages.insert(0, page)
+
+        return pages
+
+    def _get_pages_and_frames(self, page):
+        targets = []
+        for item_page in self._get_context_pages(page):
+            targets.append(item_page)
+            try:
+                targets.extend(list(item_page.frames))
+            except Exception:
+                pass
+        return targets
+
+    def _has_visible_face_verification(self, page) -> bool:
+        """只判断明确的人脸/身份验证页，避免把普通登录页当作成功。"""
+        for target in self._get_pages_and_frames(page):
+            try:
+                if self._is_face_verification_frame(target):
+                    logger.warning(
+                        f"【{self.pure_user_id}】检测到人脸/身份验证仍在显示: "
+                        f"{getattr(target, 'url', '')}"
+                    )
+                    return True
+            except Exception:
+                continue
+        return False
     
     def _check_login_success_by_element(self, page) -> bool:
         """通过页面元素检测登录是否成功
@@ -2005,8 +2044,21 @@ class XianyuSliderStealth:
         try:
             logger.info(f"【{self.pure_user_id}】========== 检查登录状态（通过页面元素） ==========")
 
-            frames = [page] + list(page.frames)
+            pages = self._get_context_pages(page)
+            frames = self._get_pages_and_frames(page)
             current_url = (getattr(page, 'url', '') or '').lower()
+
+            for idx, item_page in enumerate(pages):
+                logger.debug(
+                    f"【{self.pure_user_id}】登录状态检查页面 {idx}: "
+                    f"{getattr(item_page, 'url', '')}"
+                )
+
+            if self._has_visible_face_verification(page):
+                logger.info(
+                    f"【{self.pure_user_id}】人脸/身份验证页面仍在显示，暂不判定登录成功"
+                )
+                return False
 
             # 先检查明确成功信号。人工验证完成后，登录 iframe 可能短时间
             # 仍残留在 DOM 里；如果先看到 iframe 就返回失败，会造成已登录
@@ -2204,6 +2256,13 @@ class XianyuSliderStealth:
                             continue
                 except:
                     continue
+
+            # 有些人脸验证页直接渲染在主页面，不一定存在可识别的iframe。
+            if self._is_face_verification_frame(page):
+                logger.info(f"【{self.pure_user_id}】✅ 在主页面检测到人脸验证页面")
+                logger.info(f"【{self.pure_user_id}】人脸验证页面URL: {page.url}")
+                screenshot_path = self._save_face_verification_screenshot(page, page)
+                return True, VerificationFrame(page, page.url, screenshot_path, "face")
             
             # 检测所有frames中的二维码/人脸验证
             # 首先检查是否有 alibaba-login-box iframe（人脸验证或短信验证）
@@ -2367,7 +2426,18 @@ class XianyuSliderStealth:
                             continue
                     
                     # 人脸验证的关键词（更精确）
-                    face_keywords = ['拍摄脸部', '人脸验证', '人脸识别', '面部验证', '请进行人脸验证', '请完成人脸识别']
+                    face_keywords = [
+                        '拍摄脸部',
+                        '人脸验证',
+                        '人脸识别',
+                        '面部验证',
+                        '请进行人脸验证',
+                        '请完成人脸识别',
+                        '为确认是你本人操作',
+                        '手机版闲鱼扫描二维码',
+                        '扫描完成后请勿关闭窗口',
+                        '验证通过会自动跳转',
+                    ]
                     try:
                         frame_content = frame.content()
                         # 检查是否包含人脸验证关键词，但不包含滑块相关关键词
@@ -2403,27 +2473,45 @@ class XianyuSliderStealth:
 
     def _get_frame_text(self, frame) -> str:
         """尽量读取frame可见文本，用于区分登录二维码和人脸验证。"""
+        texts = []
         try:
-            return frame.inner_text("body")
+            title = frame.title()
+            if title:
+                texts.append(title)
+        except Exception:
+            pass
+
+        try:
+            body_text = frame.inner_text("body")
+            if body_text:
+                texts.append(body_text)
         except TypeError:
             try:
-                return frame.inner_text("body", timeout=1000)
+                body_text = frame.inner_text("body", timeout=1000)
+                if body_text:
+                    texts.append(body_text)
             except Exception:
                 pass
         except Exception:
             pass
 
         try:
-            return frame.content()
+            content = frame.content()
+            if content:
+                texts.append(content)
         except Exception:
-            return ""
+            pass
+
+        return "\n".join(texts)
 
     def _is_face_verification_frame(self, frame) -> bool:
         text = self._get_frame_text(frame)
         frame_url = getattr(frame, "url", "") or ""
         face_keywords = [
             "人脸", "脸部", "刷脸", "面部", "拍摄脸部",
-            "实人认证", "身份认证", "身份验证"
+            "实人认证", "身份认证", "身份验证",
+            "为确认是你本人操作", "手机版闲鱼扫描二维码",
+            "扫描完成后请勿关闭窗口", "验证通过会自动跳转"
         ]
         return any(keyword in text or keyword in frame_url for keyword in face_keywords)
 
@@ -3541,12 +3629,28 @@ class XianyuSliderStealth:
                             time.sleep(1)
                             login_success = self._check_login_success_by_element(page)
                             if not login_success:
-                                logger.error(f"【{self.pure_user_id}】❌ 登录状态未确认，无法获取Cookie")
-                                self.last_login_error = (
-                                    "登录状态未确认：普通登录页面未提供可用的人脸验证入口，"
-                                    "且未获得认证Cookie"
-                                )
-                                return None
+                                if show_browser:
+                                    logger.warning(
+                                        f"【{self.pure_user_id}】未识别到二维码/人脸验证，但当前为有头登录，"
+                                        "保持浏览器打开并等待人工完成验证"
+                                    )
+                                    login_success = self._wait_for_manual_login(
+                                        page,
+                                        max_wait_time=450,
+                                        check_interval=10,
+                                    )
+                                    if login_success:
+                                        logger.success(f"【{self.pure_user_id}】✅ 人工验证后登录状态已确认")
+                                    else:
+                                        logger.error(f"【{self.pure_user_id}】❌ 人工验证等待超时，无法获取Cookie")
+                                        return None
+                                else:
+                                    logger.error(f"【{self.pure_user_id}】❌ 登录状态未确认，无法获取Cookie")
+                                    self.last_login_error = (
+                                        "登录状态未确认：普通登录页面未提供可用的人脸验证入口，"
+                                        "且未获得认证Cookie"
+                                    )
+                                    return None
                             else:
                                 logger.success(f"【{self.pure_user_id}】✅ 登录状态已确认")
                     

@@ -23,6 +23,8 @@ import aiohttp
 from collections import defaultdict
 from db_manager import db_manager
 
+APP_PROCESS_START_TIME = time.time()
+
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
 
@@ -637,6 +639,8 @@ class XianyuLive:
                 cmdline = ' '.join(proc.info.get('cmdline') or []).lower()
                 exe = (proc.info.get('exe') or '').lower()
                 create_time = proc.info.get('create_time') or current_time
+                if create_time >= APP_PROCESS_START_TIME - 60:
+                    return False
                 if current_time - create_time < min_age_seconds:
                     return False
                 haystack = ' '.join([name, cmdline, exe])
@@ -801,6 +805,7 @@ class XianyuLive:
         self.delivery_sent_orders = set()  # 记录已发货的订单ID，防止重复发货
 
         self.session = None  # 用于API调用的aiohttp session
+        self._order_detail_fetch_attempts = {}  # 每个订单详情只尝试一次
 
         # 启动定期清理过期暂停记录的任务
         self.cleanup_task = None
@@ -4843,7 +4848,21 @@ class XianyuLive:
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
     async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, chat_id: str = None, debug_headless: bool = None):
-        """获取订单详情信息（使用独立的锁机制，不受延迟锁影响）"""
+        """获取订单详情信息，同一订单只尝试一次。"""
+        if order_id in self._order_detail_fetch_attempts:
+            logger.info(
+                f"【{self.cookie_id}】订单 {order_id} 已尝试获取详情，不再重复访问订单详情页面"
+            )
+            return None
+
+        self._order_detail_fetch_attempts[order_id] = time.time()
+        if len(self._order_detail_fetch_attempts) > 3000:
+            oldest_order_id = min(
+                self._order_detail_fetch_attempts,
+                key=self._order_detail_fetch_attempts.get,
+            )
+            self._order_detail_fetch_attempts.pop(oldest_order_id, None)
+
         # 使用独立的订单详情锁，不与自动发货锁冲突
         order_detail_lock = self._order_detail_locks[order_id]
 
@@ -8055,6 +8074,29 @@ class XianyuLive:
                 if order_id:
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 检测到订单ID: {order_id}，开始获取订单详情')
+
+                    # 金额详情不再自动访问，但先保存订单基础信息，供状态处理器更新状态。
+                    try:
+                        from db_manager import db_manager
+                        db_manager.insert_or_update_order(
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=(
+                                send_user_id
+                                if str(send_user_id or "").split("@", 1)[0] != str(self.myid or "")
+                                else None
+                            ),
+                            chat_id=chat_id,
+                            cookie_id=self.cookie_id,
+                        )
+                        logger.info(
+                            f"【{self.cookie_id}】订单 {order_id} 基础信息已保存，跳过详情页金额获取"
+                        )
+                    except Exception as base_order_error:
+                        logger.warning(
+                            f"【{self.cookie_id}】保存订单 {order_id} 基础信息失败: "
+                            f"{self._safe_str(base_order_error)}"
+                        )
 
                     # 通知订单状态处理器订单ID已提取
                     if self.order_status_handler:
