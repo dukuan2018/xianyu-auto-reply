@@ -199,7 +199,7 @@ class OrderDetailFetcher:
         except Exception as e:
             logger.error(f"设置Cookie失败: {e}")
 
-    async def fetch_order_detail(self, order_id: str, timeout: int = 30) -> Optional[Dict[str, Any]]:
+    async def fetch_order_detail(self, order_id: str, timeout: int = 30, use_cache: bool = True) -> Optional[Dict[str, Any]]:
         """
         获取订单详情（带锁机制和数据库缓存）
 
@@ -217,56 +217,36 @@ class OrderDetailFetcher:
             logger.info(f"🔒 获取订单 {order_id} 的锁，开始处理...")
 
             try:
-                # 首先查询数据库中是否已存在该订单（在初始化浏览器之前）
-                from db_manager import db_manager
-                existing_order = db_manager.get_order_by_id(order_id)
+                if use_cache:
+                    # 首先查询数据库中是否已存在该订单（在初始化浏览器之前）
+                    from db_manager import db_manager
+                    existing_order = db_manager.get_order_by_id(order_id)
 
-                if existing_order:
-                    # 检查金额字段是否有效（不为空且不为0）
-                    amount = existing_order.get('amount', '')
-                    amount_valid = False
+                    if existing_order:
+                        cached_buyer_id = existing_order.get('buyer_id', '')
+                        if cached_buyer_id:
+                            logger.info(f"📋 订单 {order_id} 已存在于数据库中且有买家ID，直接返回缓存详情")
+                            print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
-                    if amount:
-                        # 移除可能的货币符号和空格，检查是否为有效数字
-                        amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                        try:
-                            amount_value = float(amount_clean)
-                            amount_valid = amount_value > 0
-                        except (ValueError, TypeError):
-                            amount_valid = False
-
-                    if amount_valid:
-                        logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
-                        print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
-
-                        # 构建返回格式，与浏览器获取的格式保持一致
-                        result = {
-                            'order_id': existing_order['order_id'],
-                            'url': f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller",
-                            'title': f"订单详情 - {order_id}",
-                            'sku_info': {
+                            result = {
+                                'order_id': existing_order['order_id'],
+                                'buyer_id': cached_buyer_id,
+                                'url': f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller",
+                                'title': f"订单详情 - {order_id}",
+                                'sku_info': {
+                                    'spec_name': existing_order.get('spec_name', ''),
+                                    'spec_value': existing_order.get('spec_value', ''),
+                                    'quantity': existing_order.get('quantity', '')
+                                },
                                 'spec_name': existing_order.get('spec_name', ''),
                                 'spec_value': existing_order.get('spec_value', ''),
                                 'quantity': existing_order.get('quantity', ''),
-                                'amount': existing_order.get('amount', '')
-                            },
-                            'spec_name': existing_order.get('spec_name', ''),
-                            'spec_value': existing_order.get('spec_value', ''),
-                            'quantity': existing_order.get('quantity', ''),
-                            'amount': existing_order.get('amount', ''),
-                            'timestamp': time.time(),
-                            'from_cache': True  # 标记数据来源
-                        }
-                        return result
-                    else:
-                        logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                        print(f"⚠️ 订单 {order_id} 金额无效，本次放弃获取详情...")
+                                'timestamp': time.time(),
+                                'from_cache': True
+                            }
+                            return result
 
-                logger.info(
-                    f"订单 {order_id} 未获取到有效金额，按策略放弃，"
-                    "不访问订单详情页面"
-                )
-                return None
+                        logger.info(f"📋 订单 {order_id} 已存在但买家ID为空，继续访问详情页补充买家ID")
 
                 if not await self._ensure_browser_ready():
                     logger.error("浏览器初始化失败，无法获取订单详情")
@@ -334,23 +314,27 @@ class OrderDetailFetcher:
                     logger.warning(f"获取页面标题失败: {e}")
                     title = f"订单详情 - {order_id}"
 
+                buyer_id = await self._extract_buyer_id_from_page()
+
                 result = {
                     'order_id': order_id,
+                    'buyer_id': buyer_id,
                     'url': url,
                     'title': title,
                     'sku_info': sku_info,  # 包含解析后的规格信息
                     'spec_name': sku_info.get('spec_name', '') if sku_info else '',
                     'spec_value': sku_info.get('spec_value', '') if sku_info else '',
                     'quantity': sku_info.get('quantity', '') if sku_info else '',  # 数量
-                    'amount': sku_info.get('amount', '') if sku_info else '',      # 金额
                     'timestamp': time.time(),
                     'from_cache': False  # 标记数据来源
                 }
 
                 logger.info(f"订单详情获取成功: {order_id}")
+                if buyer_id:
+                    logger.info(f"买家ID: {buyer_id}")
                 if sku_info:
                     logger.info(f"规格信息 - 名称: {result['spec_name']}, 值: {result['spec_value']}")
-                    logger.info(f"数量: {result['quantity']}, 金额: {result['amount']}")
+                    logger.info(f"数量: {result['quantity']}")
                 return result
 
             except Exception as e:
@@ -397,8 +381,49 @@ class OrderDetailFetcher:
             logger.error(f"解析SKU内容异常: {e}")
             return {}
 
+    async def _extract_buyer_id_from_page(self) -> str:
+        """从订单详情页源码或可见文本中尽量提取买家ID。"""
+        try:
+            if not await self._check_browser_status():
+                return ''
+
+            sources = []
+            try:
+                sources.append(await self.page.content())
+            except Exception as e:
+                logger.debug(f"获取页面源码失败，跳过 buyer_id 源码解析: {e}")
+            try:
+                sources.append(await self.page.inner_text('body'))
+            except Exception as e:
+                logger.debug(f"获取页面文本失败，跳过 buyer_id 文本解析: {e}")
+
+            patterns = [
+                r'"(?:buyerId|buyer_id|buyerUserId|buyerUserID|peerUserId|peer_user_id)"\s*:\s*"([^"]+)"',
+                r"'(?:buyerId|buyer_id|buyerUserId|buyerUserID|peerUserId|peer_user_id)'\s*:\s*'([^']+)'",
+                r'(?:buyerId|buyer_id|buyerUserId|buyerUserID|peerUserId|peer_user_id)\s*[:=]\s*["\']?([A-Za-z0-9+/=_\-.]{6,})',
+                r'(?:买家ID|买家id|买家用户ID|买家用户id)\s*[:：]\s*([A-Za-z0-9+/=_\-.]{6,})',
+            ]
+
+            for source in sources:
+                if not source:
+                    continue
+                for pattern in patterns:
+                    match = re.search(pattern, source, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        buyer_id = match.group(1).strip()
+                        if buyer_id:
+                            logger.info(f"提取到买家ID: {buyer_id}")
+                            print(f"👤 买家ID: {buyer_id}")
+                            return buyer_id
+
+            logger.warning("订单详情页未提取到买家ID")
+            return ''
+        except Exception as e:
+            logger.warning(f"提取买家ID失败: {e}")
+            return ''
+
     async def _get_sku_content(self) -> Optional[Dict[str, str]]:
-        """获取并解析SKU内容，包括规格、数量和金额"""
+        """获取并解析SKU内容，包括规格和数量"""
         try:
             # 检查浏览器状态
             if not await self._check_browser_status():
@@ -413,52 +438,6 @@ class OrderDetailFetcher:
 
             logger.info(f"找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
             print(f"🔍 找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
-
-            amount = ''
-            amount_selectors = [
-                '.boldNum--JgEOXfA3',
-                '[class*="boldNum"]',
-                '[class*="price"]',
-                '[class*="Price"]',
-                '[class*="amount"]',
-                '[class*="Amount"]',
-            ]
-            for amount_selector in amount_selectors:
-                amount_elements = await self.page.query_selector_all(amount_selector)
-                for amount_element in amount_elements:
-                    amount_text = await amount_element.text_content()
-                    if amount_text:
-                        amount_match = re.search(r'[¥￥]?\s*\d+(?:\.\d{1,2})?', amount_text.strip())
-                        if amount_match:
-                            amount = amount_match.group(0).strip()
-                            logger.info(f"找到金额: {amount} (selector={amount_selector})")
-                            print(f"💰 金额: {amount}")
-                            result['amount'] = amount
-                            break
-                if amount:
-                    break
-
-            if not amount:
-                try:
-                    page_text = await self.page.inner_text('body')
-                    amount_patterns = [
-                        r'(?:实付款|实付|应付款|应付|合计|总价|订单金额|价格|金额)\s*[:：]?\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)',
-                        r'[¥￥]\s*(\d+(?:\.\d{1,2})?)'
-                    ]
-                    for pattern in amount_patterns:
-                        amount_match = re.search(pattern, page_text)
-                        if amount_match:
-                            amount = amount_match.group(1).strip()
-                            logger.info(f"从页面文本提取金额: {amount}")
-                            print(f"💰 金额: {amount}")
-                            result['amount'] = amount
-                            break
-                except Exception as amount_e:
-                    logger.warning(f"从页面文本提取金额失败: {amount_e}")
-
-            if not amount:
-                logger.warning("未找到金额元素")
-                print("⚠️ 未找到金额信息")
 
             # 处理 sku--u_ddZval 元素
             if len(sku_elements) == 2:
@@ -702,7 +681,7 @@ class OrderDetailFetcher:
 
 
 # 便捷函数
-async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, headless: bool = True) -> Optional[Dict[str, Any]]:
+async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, headless: bool = True, use_cache: bool = True) -> Optional[Dict[str, Any]]:
     """
     简单的订单详情获取函数（优化版：先检查数据库，再初始化浏览器）
 
@@ -720,57 +699,44 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
         - spec_name: 规格名称
         - spec_value: 规格值
         - quantity: 数量
-        - amount: 金额
+        - buyer_id: 买家ID
         - timestamp: 获取时间戳
         失败时返回None
     """
-    # 先检查数据库中是否有有效数据
-    try:
-        from db_manager import db_manager
-        existing_order = db_manager.get_order_by_id(order_id)
+    if use_cache:
+        # 先检查数据库中是否有有效数据
+        try:
+            from db_manager import db_manager
+            existing_order = db_manager.get_order_by_id(order_id)
 
-        if existing_order:
-            # 检查金额字段是否有效
-            amount = existing_order.get('amount', '')
-            amount_valid = False
+            if existing_order:
+                cached_buyer_id = existing_order.get('buyer_id', '')
+                if cached_buyer_id:
+                    logger.info(f"📋 订单 {order_id} 已存在于数据库中且有买家ID，直接返回缓存数据")
+                    print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
-            if amount:
-                amount_clean = str(amount).replace('¥', '').replace('￥', '').replace('$', '').strip()
-                try:
-                    amount_value = float(amount_clean)
-                    amount_valid = amount_value > 0
-                except (ValueError, TypeError):
-                    amount_valid = False
-
-            if amount_valid:
-                logger.info(f"📋 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
-                print(f"✅ 订单 {order_id} 使用缓存数据，跳过浏览器获取")
-
-                # 构建返回格式
-                result = {
-                    'order_id': existing_order['order_id'],
-                    'url': f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller",
-                    'title': f"订单详情 - {order_id}",
-                    'sku_info': {
+                    result = {
+                        'order_id': existing_order['order_id'],
+                        'buyer_id': cached_buyer_id,
+                        'url': f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller",
+                        'title': f"订单详情 - {order_id}",
+                        'sku_info': {
+                            'spec_name': existing_order.get('spec_name', ''),
+                            'spec_value': existing_order.get('spec_value', ''),
+                            'quantity': existing_order.get('quantity', '')
+                        },
                         'spec_name': existing_order.get('spec_name', ''),
                         'spec_value': existing_order.get('spec_value', ''),
                         'quantity': existing_order.get('quantity', ''),
-                        'amount': existing_order.get('amount', '')
-                    },
-                    'spec_name': existing_order.get('spec_name', ''),
-                    'spec_value': existing_order.get('spec_value', ''),
-                    'quantity': existing_order.get('quantity', ''),
-                    'amount': existing_order.get('amount', ''),
-                    'order_status': existing_order.get('order_status', 'unknown'),  # 添加订单状态
-                    'timestamp': time.time(),
-                    'from_cache': True
-                }
-                return result
-            else:
-                logger.info(f"📋 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
-                print(f"⚠️ 订单 {order_id} 金额无效，重新获取详情...")
-    except Exception as e:
-        logger.warning(f"检查数据库缓存失败: {e}")
+                        'order_status': existing_order.get('order_status', 'unknown'),
+                        'timestamp': time.time(),
+                        'from_cache': True
+                    }
+                    return result
+
+                logger.info(f"📋 订单 {order_id} 已存在但买家ID为空，继续浏览器获取详情")
+        except Exception as e:
+            logger.warning(f"检查数据库缓存失败: {e}")
 
     # 数据库中没有有效数据，使用浏览器获取
     logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
@@ -778,7 +744,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
 
     fetcher = OrderDetailFetcher(cookie_string, headless)
     try:
-        return await fetcher.fetch_order_detail(order_id)
+        return await fetcher.fetch_order_detail(order_id, use_cache=use_cache)
     finally:
         await fetcher.close()
     return None
@@ -799,10 +765,10 @@ if __name__ == "__main__":
             print(f"📋 订单ID: {result['order_id']}")
             print(f"🌐 URL: {result['url']}")
             print(f"📄 页面标题: {result['title']}")
+            print(f"👤 买家ID: {result.get('buyer_id', '未获取到')}")
             print(f"🛍️ 规格名称: {result.get('spec_name', '未获取到')}")
             print(f"📝 规格值: {result.get('spec_value', '未获取到')}")
             print(f"🔢 数量: {result.get('quantity', '未获取到')}")
-            print(f"💰 金额: {result.get('amount', '未获取到')}")
         else:
             print("❌ 订单详情获取失败")
     

@@ -1145,12 +1145,19 @@ class SendMessageRequest(BaseModel):
 
 
 class SendImageRequest(BaseModel):
+    api_key: str
     cookie_id: str
     chat_id: str
     to_user_id: str
     image_base64: Optional[str] = None
     image_url: Optional[str] = None
     filename: Optional[str] = "api_image.jpg"
+
+
+class OrderDetailWithBuyerRequest(BaseModel):
+    api_key: str
+    cookie_id: str
+    order_id: str
 
 
 class SendMessageResponse(BaseModel):
@@ -1223,6 +1230,7 @@ async def send_message_api(request: SendMessageRequest):
             return param_str
 
         # 清理所有参数
+        cleaned_api_key = clean_param(request.api_key)
         cleaned_cookie_id = clean_param(request.cookie_id)
         cleaned_chat_id = clean_param(request.chat_id)
         cleaned_to_user_id = clean_param(request.to_user_id)
@@ -1327,6 +1335,17 @@ async def send_image_api(request: SendImageRequest):
         cleaned_to_user_id = clean_param(request.to_user_id)
         cleaned_image_url = clean_param(request.image_url)
         cleaned_filename = clean_param(request.filename) or "api_image.jpg"
+
+        cleaned_api_key = clean_param(request.api_key)
+        if not cleaned_api_key:
+            logger.warning("API秘钥为空")
+            return SendMessageResponse(success=False, message="API秘钥不能为空")
+        if cleaned_api_key == "mochoo_test_key":
+            logger.info("使用测试秘钥，直接返回成功")
+            return SendMessageResponse(success=True, message="接口验证成功")
+        if not verify_api_key(cleaned_api_key):
+            logger.warning(f"API秘钥验证失败: {cleaned_api_key}")
+            return SendMessageResponse(success=False, message="API秘钥验证失败")
 
         required_params = {
             'cookie_id': cleaned_cookie_id,
@@ -6087,6 +6106,71 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
     except Exception as e:
         log_with_user('error', f"查询订单详情失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
+
+
+@app.post('/api/orders/detail-with-buyer')
+async def get_order_detail_with_buyer(request: OrderDetailWithBuyerRequest):
+    """按订单ID获取订单详情，并尝试补充买家ID。"""
+    try:
+        from utils.order_detail_fetcher import fetch_order_detail_simple
+
+        def strip_amount_fields(value):
+            if isinstance(value, dict):
+                return {
+                    key: strip_amount_fields(item)
+                    for key, item in value.items()
+                    if key not in ('amount', 'order_amount')
+                }
+            if isinstance(value, list):
+                return [strip_amount_fields(item) for item in value]
+            return value
+
+        cleaned_api_key = (request.api_key or '').strip()
+        cookie_id = (request.cookie_id or '').strip()
+        order_id = (request.order_id or '').strip()
+
+        if not cleaned_api_key:
+            return JSONResponse(status_code=200, content={"success": False, "message": "API秘钥不能为空"})
+        if cleaned_api_key == "mochoo_test_key":
+            return JSONResponse(status_code=200, content={"success": True, "message": "接口验证成功", "data": {}})
+        if not verify_api_key(cleaned_api_key):
+            return JSONResponse(status_code=200, content={"success": False, "message": "API秘钥验证失败"})
+
+        if not cookie_id or not order_id:
+            return JSONResponse(status_code=200, content={"success": False, "message": "cookie_id 和 order_id 不能为空"})
+
+        logger.info(f"按订单ID获取详情和买家ID: order_id={order_id}, cookie_id={cookie_id}")
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if not live_instance:
+            return JSONResponse(status_code=200, content={"success": False, "message": "账号实例不存在或未连接，请先启动账号"})
+        if not getattr(live_instance, 'cookies_str', None):
+            return JSONResponse(status_code=200, content={"success": False, "message": "账号cookie为空，无法拉取订单详情"})
+
+        detail = await fetch_order_detail_simple(
+            order_id,
+            live_instance.cookies_str,
+            headless=True,
+            use_cache=False
+        )
+        if not detail:
+            return JSONResponse(status_code=200, content={"success": False, "message": "拉取订单详情失败"})
+
+        response_detail = strip_amount_fields(detail)
+        return {
+            "success": True,
+            "data": {
+                "order_id": order_id,
+                "cookie_id": cookie_id,
+                "buyer_id": response_detail.get('buyer_id', '') if isinstance(response_detail, dict) else '',
+                "detail": response_detail
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"按订单ID获取详情和买家ID失败: {str(e)}")
+        return JSONResponse(status_code=200, content={"success": False, "message": f"获取订单详情失败: {str(e)}"})
 
 
 @app.delete('/api/orders/{order_id}')

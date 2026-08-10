@@ -778,6 +778,7 @@ class XianyuLive:
         self.last_ws_message_time = 0
         self.ws_send_lock = asyncio.Lock()
         self.order_buyer_cache = {}
+        self.pushed_order_statuses = set()
 
         # Token刷新相关配置
         self.token_refresh_interval = TOKEN_REFRESH_INTERVAL
@@ -1432,6 +1433,120 @@ class XianyuLive:
         except Exception as e:
             logger.debug(f"【{self.cookie_id}】递归提取订单ID失败({path}): {self._safe_str(e)}")
             return None
+
+    def _log_order_id_missing_message(self, msg_time: str, event_name: str, message: dict,
+                                      user_id: str = None, item_id: str = None, chat_id: str = None):
+        """Log compact message payload when a trade reminder has no order id."""
+        try:
+            message_keys = list(message.keys()) if isinstance(message, dict) else []
+            compact_message = json.dumps(message, ensure_ascii=False, default=str)
+            if len(compact_message) > 4000:
+                compact_message = compact_message[:4000] + "...<truncated>"
+            logger.warning(
+                f'[{msg_time}] 【{self.cookie_id}】{event_name}未提取到订单号，'
+                f'无法推送chatNodify: user_id={user_id}, item_id={item_id}, '
+                f'chat_id={chat_id}, keys={message_keys}, message={compact_message}'
+            )
+        except Exception as e:
+            logger.warning(
+                f'[{msg_time}] 【{self.cookie_id}】{event_name}未提取到订单号，'
+                f'且记录消息报文失败: {self._safe_str(e)}'
+            )
+
+    def _build_order_event_diag(self, message: dict, order_id: str = None, order_status: str = None,
+                                chat_id: str = None, user_id: str = None, item_id: str = None,
+                                reason: str = None) -> dict:
+        """Build a compact diagnostics object for order-event logs."""
+        diag = {
+            "cookieId": str(self.cookie_id or ""),
+            "orderId": str(order_id or ""),
+            "orderStatus": str(order_status or ""),
+            "reason": str(reason or ""),
+            "chatId": str(chat_id or ""),
+            "userId": str(user_id or ""),
+            "itemId": str(item_id or ""),
+            "peerUserId": "",
+            "messageId": "",
+            "messageType": "unknown",
+            "keys": [],
+            "title": "",
+            "redReminder": "",
+            "reminderUrl": "",
+            "updateKey": "",
+            "orderIdHints": [],
+        }
+        try:
+            if not isinstance(message, dict):
+                diag["messageType"] = type(message).__name__
+                return diag
+
+            diag["keys"] = list(message.keys())
+            diag["peerUserId"] = str(self._extract_peer_user_id_from_message(message) or "")
+            diag["messageId"] = str(self._extract_message_id(message) or "")
+
+            message_1 = message.get("1")
+            message_10 = message_1.get("10") if isinstance(message_1, dict) and isinstance(message_1.get("10"), dict) else {}
+            message_3 = message.get("3") if isinstance(message.get("3"), dict) else {}
+            message_4 = message.get("4") if isinstance(message.get("4"), dict) else {}
+
+            if message_10:
+                diag["messageType"] = "full_order_card"
+                diag["title"] = str(
+                    message_10.get("reminderContent")
+                    or message_10.get("reminderTitle")
+                    or message_10.get("reminderNotice")
+                    or ""
+                )
+                diag["redReminder"] = str(message_10.get("redReminder") or "")
+                diag["reminderUrl"] = str(message_10.get("reminderUrl") or "")[:500]
+                ext_json = str(message_10.get("extJson") or "")
+                try:
+                    ext_obj = json.loads(ext_json) if ext_json else {}
+                    diag["updateKey"] = str(ext_obj.get("updateKey") or "")
+                except Exception:
+                    diag["updateKey"] = ""
+            elif message_3.get("redReminder"):
+                diag["messageType"] = "red_reminder_only"
+                diag["redReminder"] = str(message_3.get("redReminder") or "")
+                diag["title"] = diag["redReminder"]
+            elif message_4.get("reminderContent"):
+                diag["messageType"] = "card_ui_update"
+                diag["title"] = str(message_4.get("reminderContent") or "")
+                diag["redReminder"] = str(message_4.get("redReminder") or "")
+                diag["reminderUrl"] = str(message_4.get("reminderUrl") or "")[:500]
+
+            message_str = json.dumps(message, ensure_ascii=False, default=str)
+            hints = []
+            for label, pattern in (
+                ("orderId", r'orderId[=:](\d{10,})'),
+                ("order_detail", r'order_detail\?id=(\d{10,})'),
+                ("bizOrderId", r'bizOrderId[=:](\d{10,})'),
+                ("updateKey", r'updateKey["\']?\s*[:=]\s*["\']?[^"\']*?:(\d{10,})[:"]'),
+            ):
+                match = re.search(pattern, message_str)
+                if match:
+                    hints.append(f"{label}:{match.group(1)}")
+            diag["orderIdHints"] = hints[:5]
+        except Exception as e:
+            diag["diagError"] = self._safe_str(e)
+        return diag
+
+    def _log_order_event_diag(self, stage: str, message: dict, order_id: str = None, order_status: str = None,
+                              chat_id: str = None, user_id: str = None, item_id: str = None,
+                              reason: str = None, level: str = "info"):
+        """Write one-line order-event diagnostics with a stable searchable prefix."""
+        try:
+            diag = self._build_order_event_diag(message, order_id, order_status, chat_id, user_id, item_id, reason)
+            text = json.dumps(diag, ensure_ascii=False, default=str)
+            log_text = f"[ORDER-EVENT][{stage}] {text}"
+            if level == "warning":
+                logger.warning(log_text)
+            elif level == "error":
+                logger.error(log_text)
+            else:
+                logger.info(log_text)
+        except Exception as e:
+            logger.warning(f"[ORDER-EVENT][{stage}] log failed: {self._safe_str(e)}")
 
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
@@ -4198,16 +4313,29 @@ class XianyuLive:
         """识别需要推送给Java后台的订单状态。"""
         try:
             message_text = json.dumps(message, ensure_ascii=False) if isinstance(message, dict) else str(message or "")
+            skip_keywords = ("小红花", "评价", "求买家送我", "送Ta")
+            if any(keyword in message_text for keyword in skip_keywords):
+                return ""
+
+            message_1 = message.get("1") if isinstance(message, dict) else None
+            message_10 = message_1.get("10") if isinstance(message_1, dict) and isinstance(message_1.get("10"), dict) else {}
+            reminder_content = str(message_10.get("reminderContent") or "")
+            reminder_title = str(message_10.get("reminderTitle") or "")
+            reminder_notice = str(message_10.get("reminderNotice") or "")
+            red_reminder = str(message_10.get("redReminder") or "")
+            detail_notice = str(message_10.get("detailNotice") or "")
+            biz_tag = str(message_10.get("bizTag") or "")
+            status_text = " ".join([reminder_content, reminder_title, reminder_notice, red_reminder, detail_notice, biz_tag])
+
             if "我已修改价格，等待你付款" in message_text:
                 return ""
-            if "我已拍下，待付款" in message_text or "等待买家付款" in message_text:
+            if "我已拍下，待付款" in status_text or "等待买家付款" in status_text:
                 return "pending_payment"
             if (
-                "我已付款，等待你发货" in message_text
-                or "等待卖家发货" in message_text
-                or "等待你发货" in message_text
-                or "已付款，待发货" in message_text
-                or "买家已付款" in message_text
+                "我已付款，等待你发货" in status_text
+                or "等待卖家发货" in status_text
+                or "付款完成待发货" in status_text
+                or "TRADE_PAID_DONE_SELLER" in status_text
             ):
                 return "paid"
             return ""
@@ -4230,7 +4358,7 @@ class XianyuLive:
             import aiohttp
 
             if not order_id or not order_status:
-                return
+                return False
 
             api_url = (
                 (GOOFISH_CHAT_API or {}).get("url")
@@ -4247,14 +4375,36 @@ class XianyuLive:
 
             if not api_url:
                 logger.warning("goofish.chat.api.url 未配置，跳过订单事件推送")
-                return
+                self._log_order_event_diag(
+                    "skip", message, order_id, order_status, user_id=user_id,
+                    item_id=item_id, reason="api_url_missing", level="warning"
+                )
+                return False
             if not api_key:
                 logger.warning("goofish.chat.api.key 未配置，跳过订单事件推送")
-                return
+                self._log_order_event_diag(
+                    "skip", message, order_id, order_status, user_id=user_id,
+                    item_id=item_id, reason="api_key_missing", level="warning"
+                )
+                return False
 
             resolved_user_id = self._extract_peer_user_id_from_message(message) if isinstance(message, dict) else None
             if not resolved_user_id:
-                resolved_user_id = user_id
+                logger.warning(f"【{self.cookie_id}】订单事件缺少peerUserId，跳过推送: order_id={order_id}, status={order_status}")
+                self._log_order_event_diag(
+                    "skip", message, order_id, order_status, chat_id, user_id,
+                    item_id, reason="peer_user_id_missing", level="warning"
+                )
+                return False
+
+            order_status_key = (str(order_id or ""), str(order_status or ""))
+            if order_status_key in self.pushed_order_statuses:
+                logger.debug(f"【{self.cookie_id}】订单事件已推送，跳过重复: order_id={order_id}, status={order_status}")
+                self._log_order_event_diag(
+                    "skip", message, order_id, order_status, chat_id, resolved_user_id,
+                    item_id, reason="duplicate_pushed"
+                )
+                return True
 
             payload = {
                 "orderId": str(order_id or ""),
@@ -4272,22 +4422,63 @@ class XianyuLive:
             }
 
             logger.info(f"【{self.cookie_id}】推送订单事件到Java后台: {payload}")
+            self._log_order_event_diag(
+                "push-start", message, order_id, order_status, chat_id, resolved_user_id,
+                item_id, reason="ready_to_post"
+            )
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(api_url, json=payload, headers=headers) as response:
                     response_text = await response.text()
                     if 200 <= response.status < 300:
-                        logger.info(
-                            f"【{self.cookie_id}】订单事件推送成功: order_id={order_id}, "
-                            f"status={order_status}, response={response_text[:200]}"
-                        )
+                        business_success = True
+                        try:
+                            response_json = json.loads(response_text)
+                            result = str(response_json.get("result") or response_json.get("code") or "").lower()
+                            msg = str(response_json.get("msg") or response_json.get("message") or "")
+                            business_success = result in ("success", "0", "200") or msg == "接收成功"
+                        except Exception:
+                            business_success = True
+
+                        if business_success:
+                            self.pushed_order_statuses.add(order_status_key)
+                            logger.info(
+                                f"【{self.cookie_id}】订单事件推送成功: order_id={order_id}, "
+                                f"status={order_status}, response={response_text[:200]}"
+                            )
+                            self._log_order_event_diag(
+                                "push-success", message, order_id, order_status, chat_id,
+                                resolved_user_id, item_id, reason=f"http_{response.status}"
+                            )
+                            return True
+                        else:
+                            logger.warning(
+                                f"【{self.cookie_id}】订单事件推送业务失败: order_id={order_id}, "
+                                f"status={order_status}, response={response_text[:500]}"
+                            )
+                            self._log_order_event_diag(
+                                "push-business-fail", message, order_id, order_status, chat_id,
+                                resolved_user_id, item_id, reason=response_text[:300], level="warning"
+                            )
                     else:
                         logger.warning(
                             f"【{self.cookie_id}】订单事件推送失败: HTTP {response.status}, "
                             f"response={response_text[:500]}"
                         )
+                        self._log_order_event_diag(
+                            "push-http-fail", message, order_id, order_status, chat_id,
+                            resolved_user_id, item_id, reason=f"http_{response.status}:{response_text[:200]}",
+                            level="warning"
+                        )
+            return False
         except Exception as e:
             logger.error(f"【{self.cookie_id}】订单事件推送异常: {self._safe_str(e)}")
+            self._log_order_event_diag(
+                "push-exception", message if isinstance(message, dict) else {}, order_id, order_status,
+                chat_id if 'chat_id' in locals() else None, user_id if 'user_id' in locals() else None,
+                item_id if 'item_id' in locals() else None, reason=self._safe_str(e), level="error"
+            )
+            return False
 
     def _parse_notification_config(self, config: str) -> dict:
         """解析通知配置数据"""
@@ -5129,7 +5320,7 @@ class XianyuLive:
                     spec_name = result.get('spec_name', '')
                     spec_value = result.get('spec_value', '')
                     quantity = result.get('quantity', '')
-                    amount = result.get('amount', '')
+                    detail_buyer_id = result.get('buyer_id') or buyer_id
 
                     if spec_name and spec_value:
                         logger.info(f"【{self.cookie_id}】📋 规格名称: {spec_name}")
@@ -5150,12 +5341,11 @@ class XianyuLive:
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
-                                buyer_id=buyer_id if str(buyer_id or "").split("@", 1)[0] != str(self.myid or "") else None,
+                                buyer_id=detail_buyer_id if str(detail_buyer_id or "").split("@", 1)[0] != str(self.myid or "") else None,
                                 chat_id=chat_id,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
                                 quantity=quantity,
-                                amount=amount,
                                 cookie_id=self.cookie_id
                             )
                             
@@ -8061,6 +8251,10 @@ class XianyuLive:
                 f"title={card_title}, order_id={card_order_id}, item_id={card_item_id}, "
                 f"chat_id={card_chat_id}, buyer_id={card_buyer_id}, sender_id={card_sender_id}"
             )
+            self._log_order_event_diag(
+                "summary", message, order_id=card_order_id, chat_id=card_chat_id,
+                user_id=card_buyer_id, item_id=card_item_id, reason=card_title or "card_summary"
+            )
         except Exception as e:
             logger.debug(f"【{self.cookie_id}】记录卡片消息摘要失败: {self._safe_str(e)}")
 
@@ -8300,28 +8494,35 @@ class XianyuLive:
 
             # 【优先处理】尝试获取订单ID并获取订单详情
             order_id = None
+            order_push_sent = False
             try:
                 order_id = self._extract_order_id(message)
                 if order_id:
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 检测到订单ID: {order_id}，开始获取订单详情')
+                    self._log_order_event_diag(
+                        "order-id-detected", message, order_id=order_id, reason="handle_message"
+                    )
 
-                    # 金额详情不再自动访问，但先保存订单基础信息，供状态处理器更新状态。
+                    # 先保存订单基础信息，供状态处理器更新状态。
                     try:
                         from db_manager import db_manager
+                        base_item_id = locals().get("item_id") or self.extract_item_id_from_message(message)
+                        base_buyer_id = self._extract_peer_user_id_from_message(message) or locals().get("send_user_id")
+                        base_chat_id = self.extract_chat_id_from_message(message) or locals().get("chat_id")
                         db_manager.insert_or_update_order(
                             order_id=order_id,
-                            item_id=item_id,
+                            item_id=base_item_id,
                             buyer_id=(
-                                send_user_id
-                                if str(send_user_id or "").split("@", 1)[0] != str(self.myid or "")
+                                base_buyer_id
+                                if str(base_buyer_id or "").split("@", 1)[0] != str(self.myid or "")
                                 else None
                             ),
-                            chat_id=chat_id,
+                            chat_id=base_chat_id,
                             cookie_id=self.cookie_id,
                         )
                         logger.info(
-                            f"【{self.cookie_id}】订单 {order_id} 基础信息已保存，跳过详情页金额获取"
+                            f"【{self.cookie_id}】订单 {order_id} 基础信息已保存，等待后续详情补充"
                         )
                     except Exception as base_order_error:
                         logger.warning(
@@ -8413,14 +8614,29 @@ class XianyuLive:
                         # 推送订单状态到Java后台
                         try:
                             order_push_status = self._classify_goofish_order_push_status(message)
+                            self._log_order_event_diag(
+                                "classified", message, order_id=order_id,
+                                order_status=order_push_status or "", chat_id=temp_chat_id,
+                                user_id=temp_user_id, item_id=temp_item_id,
+                                reason="matched_status" if order_push_status else "no_push_status"
+                            )
                             if order_push_status:
-                                await self.push_goofish_order_event_to_java(
+                                order_push_sent = await self.push_goofish_order_event_to_java(
                                     order_id=order_id,
                                     chat_id=temp_chat_id,
                                     user_id=temp_user_id,
                                     item_id=temp_item_id,
                                     order_status=order_push_status,
                                     message=message,
+                                )
+                            else:
+                                logger.debug(
+                                    f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 未识别到需要推送的订单状态'
+                                )
+                                self._log_order_event_diag(
+                                    "skip", message, order_id=order_id, chat_id=temp_chat_id,
+                                    user_id=temp_user_id, item_id=temp_item_id,
+                                    reason="status_not_pushable"
                                 )
                         except Exception as push_e:
                             logger.error(
@@ -8518,6 +8734,32 @@ class XianyuLive:
                     red_reminder = message["3"].get("redReminder")
 
                 if red_reminder == '等待买家付款':
+                    if not order_push_sent:
+                        red_order_id = order_id or self._extract_order_id(message)
+                        red_chat_id = self.extract_chat_id_from_message(message)
+                        self._log_order_event_diag(
+                            "red-reminder", message, order_id=red_order_id or "",
+                            order_status="pending_payment", chat_id=red_chat_id,
+                            user_id=user_id, item_id=item_id, reason="waiting_buyer_pay"
+                        )
+                        if red_order_id:
+                            order_push_sent = await self.push_goofish_order_event_to_java(
+                                order_id=red_order_id,
+                                chat_id=red_chat_id,
+                                user_id=user_id,
+                                item_id=item_id,
+                                order_status="pending_payment",
+                                message=message,
+                            )
+                        else:
+                            self._log_order_event_diag(
+                                "skip", message, order_status="pending_payment",
+                                chat_id=red_chat_id, user_id=user_id, item_id=item_id,
+                                reason="order_id_missing_in_red_reminder", level="warning"
+                            )
+                            self._log_order_id_missing_message(
+                                msg_time, "等待买家付款提醒", message, user_id, item_id, red_chat_id
+                            )
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'[{msg_time}] 【系统】等待买家 {user_url} 付款')
                     return
@@ -8526,6 +8768,32 @@ class XianyuLive:
                     logger.info(f'[{msg_time}] 【系统】买家 {user_url} 交易关闭')
                     return
                 elif red_reminder == '等待卖家发货':
+                    if not order_push_sent:
+                        red_order_id = order_id or self._extract_order_id(message)
+                        red_chat_id = self.extract_chat_id_from_message(message)
+                        self._log_order_event_diag(
+                            "red-reminder", message, order_id=red_order_id or "",
+                            order_status="paid", chat_id=red_chat_id,
+                            user_id=user_id, item_id=item_id, reason="waiting_seller_ship"
+                        )
+                        if red_order_id:
+                            order_push_sent = await self.push_goofish_order_event_to_java(
+                                order_id=red_order_id,
+                                chat_id=red_chat_id,
+                                user_id=user_id,
+                                item_id=item_id,
+                                order_status="paid",
+                                message=message,
+                            )
+                        else:
+                            self._log_order_event_diag(
+                                "skip", message, order_status="paid",
+                                chat_id=red_chat_id, user_id=user_id, item_id=item_id,
+                                reason="order_id_missing_in_red_reminder", level="warning"
+                            )
+                            self._log_order_id_missing_message(
+                                msg_time, "等待卖家发货提醒", message, user_id, item_id, red_chat_id
+                            )
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到等待卖家发货状态，触发自动发货检查')
                     try:
