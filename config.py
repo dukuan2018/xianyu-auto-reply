@@ -105,6 +105,7 @@ API_ENDPOINTS = config.get('API_ENDPOINTS', {})
 DEFAULT_HEADERS = config.get('DEFAULT_HEADERS', {})
 WEBSOCKET_HEADERS = config.get('WEBSOCKET_HEADERS', {})
 APP_CONFIG = config.get('APP_CONFIG', {})
+GOOFISH_CHAT_API = config.get('GOOFISH_CHAT_API', {})
 AUTO_REPLY = config.get('AUTO_REPLY', {
     'enabled': True,
     'send_type': 'img',

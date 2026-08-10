@@ -235,6 +235,7 @@ class OrderStatusHandler:
                     if self.config.get('use_pending_queue', True):
                         logger.info(f"📝 订单 {order_id} 不存在于数据库中，添加到待处理队列等待主程序拉取订单详情")
                         self._add_to_pending_updates(order_id, new_status, cookie_id, context)
+                        return True
                     else:
                         logger.error(f"❌ 订单 {order_id} 不存在于数据库中且未启用待处理队列，跳过状态更新")
                     return False

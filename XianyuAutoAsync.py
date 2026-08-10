@@ -16,7 +16,7 @@ from config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS
+    APP_CONFIG, API_ENDPOINTS, GOOFISH_CHAT_API
 )
 import sys
 import aiohttp
@@ -1279,6 +1279,15 @@ class XianyuLive:
                 logger.debug(f"【{self.cookie_id}】message['1'] 未知类型: {type(message_1)}")
                 # 其他类型，跳过这种提取方式
 
+            # 方法1c: 优先从message['4']中递归提取订单ID（部分卡片会把orderId放在这里）
+            if not order_id and isinstance(message, dict):
+                message_4 = message.get('4')
+                order_id = self._extract_order_id_from_object(
+                    message_4,
+                    "message['4']",
+                    max_depth=4,
+                )
+
             if content_json_str:
                 try:
                     content_data = json.loads(content_json_str)
@@ -1318,6 +1327,14 @@ class XianyuLive:
                 except Exception as parse_e:
                     logger.warning(f"解析dynamicOperation JSON失败: {parse_e}")
 
+            # 方法2b: 递归扫描message['1']整棵树，兼容卡片结构轻微变化
+            if not order_id and isinstance(message_1, (dict, list, str)):
+                order_id = self._extract_order_id_from_object(
+                    message_1,
+                    "message['1']",
+                    max_depth=5,
+                )
+
             # 方法3: 如果前面的方法都失败，尝试在整个消息中搜索订单ID模式
             if not order_id:
                 try:
@@ -1350,6 +1367,70 @@ class XianyuLive:
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
+            return None
+
+    def _extract_order_id_from_object(self, obj, path: str, max_depth: int = 4):
+        """递归扫描对象中的字符串字段，提取订单ID。"""
+        try:
+            if max_depth < 0 or obj is None:
+                return None
+
+            if isinstance(obj, str):
+                patterns = [
+                    (r'orderId=(\d{10,})', 'orderId'),
+                    (r'order_detail\?id=(\d{10,})', 'order_detail'),
+                    (r'bizOrderId=(\d{10,})', 'bizOrderId'),
+                    (r'"id"\s*:\s*"?(\d{10,})"?', 'id'),
+                ]
+                for pattern, label in patterns:
+                    match = re.search(pattern, obj)
+                    if match:
+                        order_id = match.group(1)
+                        logger.info(
+                            f"【{self.cookie_id}】✅ 从{path}字符串中提取到订单ID: {order_id} "
+                            f"(匹配: {label})"
+                        )
+                        return order_id
+                return None
+
+            if isinstance(obj, dict):
+                preferred_keys = ("targetUrl", "url", "reminderUrl", "bizTag", "extJson")
+                for key in preferred_keys:
+                    value = obj.get(key)
+                    if isinstance(value, str):
+                        extracted = self._extract_order_id_from_object(
+                            value,
+                            f"{path}.{key}",
+                            max_depth=max_depth - 1,
+                        )
+                        if extracted:
+                            return extracted
+
+                for key, value in obj.items():
+                    if isinstance(value, (dict, list, str)):
+                        extracted = self._extract_order_id_from_object(
+                            value,
+                            f"{path}.{key}",
+                            max_depth=max_depth - 1,
+                        )
+                        if extracted:
+                            return extracted
+                return None
+
+            if isinstance(obj, list):
+                for idx, value in enumerate(obj):
+                    extracted = self._extract_order_id_from_object(
+                        value,
+                        f"{path}[{idx}]",
+                        max_depth=max_depth - 1,
+                    )
+                    if extracted:
+                        return extracted
+                return None
+
+            return None
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】递归提取订单ID失败({path}): {self._safe_str(e)}")
             return None
 
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
@@ -3559,6 +3640,60 @@ class XianyuLive:
             logger.error(f"提取chat_id失败: {self._safe_str(e)}")
             return None
 
+    def _extract_peer_user_id_from_message(self, message):
+        """Extract peerUserId from order-card reminderUrl."""
+        try:
+            import re
+            from urllib.parse import unquote, urlparse, parse_qs
+
+            def parse_peer_user_id(reminder_url):
+                if not isinstance(reminder_url, str) or "peerUserId=" not in reminder_url:
+                    return None
+
+                match = re.search(r"[?&]peerUserId=([^&]+)", reminder_url)
+                if match:
+                    return unquote(match.group(1)).strip() or None
+
+                query = urlparse(reminder_url).query
+                values = parse_qs(query).get("peerUserId", [])
+                if values:
+                    return unquote(values[0]).strip() or None
+                return None
+
+            candidates = []
+            if isinstance(message, dict):
+                message_1 = message.get("1")
+                if isinstance(message_1, dict):
+                    message_10 = message_1.get("10")
+                    if isinstance(message_10, dict):
+                        candidates.append(message_10.get("reminderUrl"))
+
+                message_4 = message.get("4")
+                if isinstance(message_4, dict):
+                    candidates.append(message_4.get("reminderUrl"))
+
+                def walk(node, depth=0):
+                    if depth > 4 or not isinstance(node, dict):
+                        return
+                    reminder_url = node.get("reminderUrl")
+                    if reminder_url:
+                        candidates.append(reminder_url)
+                    for value in node.values():
+                        if isinstance(value, dict):
+                            walk(value, depth + 1)
+
+                walk(message)
+
+            for reminder_url in candidates:
+                peer_user_id = parse_peer_user_id(reminder_url)
+                if peer_user_id:
+                    return peer_user_id
+
+            return None
+        except Exception as e:
+            logger.debug(f"提取peerUserId失败: {self._safe_str(e)}")
+            return None
+
     def debug_message_structure(self, message, context=""):
         """调试消息结构的辅助方法"""
         try:
@@ -4058,6 +4193,101 @@ class XianyuLive:
             logger.error(f"📱 处理消息通知失败: {self._safe_str(e)}")
             import traceback
             logger.error(f"📱 详细错误信息: {traceback.format_exc()}")
+
+    def _classify_goofish_order_push_status(self, message: dict) -> str:
+        """识别需要推送给Java后台的订单状态。"""
+        try:
+            message_text = json.dumps(message, ensure_ascii=False) if isinstance(message, dict) else str(message or "")
+            if "我已修改价格，等待你付款" in message_text:
+                return ""
+            if "我已拍下，待付款" in message_text or "等待买家付款" in message_text:
+                return "pending_payment"
+            if (
+                "我已付款，等待你发货" in message_text
+                or "等待卖家发货" in message_text
+                or "等待你发货" in message_text
+                or "已付款，待发货" in message_text
+                or "买家已付款" in message_text
+            ):
+                return "paid"
+            return ""
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】识别订单推送状态失败: {self._safe_str(e)}")
+            return ""
+
+    async def push_goofish_order_event_to_java(
+        self,
+        order_id: str,
+        chat_id: str,
+        user_id: str,
+        item_id: str,
+        order_status: str,
+        message: dict = None,
+    ):
+        """将闲鱼订单事件推送给Java后台。"""
+        try:
+            from db_manager import db_manager
+            import aiohttp
+
+            if not order_id or not order_status:
+                return
+
+            api_url = (
+                (GOOFISH_CHAT_API or {}).get("url")
+                or db_manager.get_system_setting("goofish.chat.api.url")
+                or os.getenv("GOOFISH_CHAT_API_URL")
+                or ""
+            ).strip()
+            api_key = (
+                db_manager.get_system_setting("qq_reply_secret_key")
+                or db_manager.get_system_setting("goofish.chat.api.key")
+                or os.getenv("GOOFISH_CHAT_API_KEY")
+                or ""
+            ).strip()
+
+            if not api_url:
+                logger.warning("goofish.chat.api.url 未配置，跳过订单事件推送")
+                return
+            if not api_key:
+                logger.warning("goofish.chat.api.key 未配置，跳过订单事件推送")
+                return
+
+            resolved_user_id = self._extract_peer_user_id_from_message(message) if isinstance(message, dict) else None
+            if not resolved_user_id:
+                resolved_user_id = user_id
+
+            payload = {
+                "orderId": str(order_id or ""),
+                "sendUserId": str(resolved_user_id or ""),
+                "itemId": str(item_id or ""),
+                "goofishShopId": str(self.cookie_id or ""),
+                "goofishChatId": str(chat_id or ""),
+                "orderStatus": str(order_status or ""),
+                "messageId": self._extract_message_id(message) if isinstance(message, dict) else "",
+                "eventTime": int(time.time() * 1000),
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "X-Goofish-Chat-Key": api_key,
+            }
+
+            logger.info(f"【{self.cookie_id}】推送订单事件到Java后台: {payload}")
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(api_url, json=payload, headers=headers) as response:
+                    response_text = await response.text()
+                    if 200 <= response.status < 300:
+                        logger.info(
+                            f"【{self.cookie_id}】订单事件推送成功: order_id={order_id}, "
+                            f"status={order_status}, response={response_text[:200]}"
+                        )
+                    else:
+                        logger.warning(
+                            f"【{self.cookie_id}】订单事件推送失败: HTTP {response.status}, "
+                            f"response={response_text[:500]}"
+                        )
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】订单事件推送异常: {self._safe_str(e)}")
 
     def _parse_notification_config(self, config: str) -> dict:
         """解析通知配置数据"""
@@ -7821,6 +8051,7 @@ class XianyuLive:
             )
             card_item_id = _url_param(reminder_url, "itemId") or _url_param(card_url, "itemId")
             card_chat_id = _url_param(reminder_url, "sid") or _url_param(card_url, "sid")
+            card_buyer_id = self._extract_peer_user_id_from_message(message) or ""
             card_sender_id = str(message_10.get("senderUserId") or "").strip()
             if "@" in card_sender_id:
                 card_sender_id = card_sender_id.split("@", 1)[0]
@@ -7828,7 +8059,7 @@ class XianyuLive:
             logger.info(
                 f"[{msg_time}] 【{self.cookie_id}】卡片消息摘要: "
                 f"title={card_title}, order_id={card_order_id}, item_id={card_item_id}, "
-                f"chat_id={card_chat_id}, sender_id={card_sender_id}"
+                f"chat_id={card_chat_id}, buyer_id={card_buyer_id}, sender_id={card_sender_id}"
             )
         except Exception as e:
             logger.debug(f"【{self.cookie_id}】记录卡片消息摘要失败: {self._safe_str(e)}")
@@ -8152,6 +8383,10 @@ class XianyuLive:
                         except:
                             temp_user_id = "unknown_user"
 
+                        temp_peer_user_id = self._extract_peer_user_id_from_message(message)
+                        if temp_peer_user_id:
+                            temp_user_id = temp_peer_user_id
+
                         # 提取商品ID
                         try:
                             if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
@@ -8174,6 +8409,24 @@ class XianyuLive:
 
                         # 提取chat_id（会话ID，从reminderUrl的sid参数提取）
                         temp_chat_id = self.extract_chat_id_from_message(message)
+
+                        # 推送订单状态到Java后台
+                        try:
+                            order_push_status = self._classify_goofish_order_push_status(message)
+                            if order_push_status:
+                                await self.push_goofish_order_event_to_java(
+                                    order_id=order_id,
+                                    chat_id=temp_chat_id,
+                                    user_id=temp_user_id,
+                                    item_id=temp_item_id,
+                                    order_status=order_push_status,
+                                    message=message,
+                                )
+                        except Exception as push_e:
+                            logger.error(
+                                f'[{msg_time}] 【{self.cookie_id}】推送订单事件到Java后台失败: '
+                                f'{self._safe_str(push_e)}'
+                            )
 
                         # 调用订单详情获取方法
                         order_detail = await self.fetch_order_detail_info(order_id, temp_item_id, temp_user_id, temp_chat_id)
@@ -8225,6 +8478,10 @@ class XianyuLive:
             except Exception as e:
                 logger.warning(f"提取用户ID失败: {self._safe_str(e)}")
                 user_id = "unknown_user"
+
+            peer_user_id = self._extract_peer_user_id_from_message(message)
+            if peer_user_id:
+                user_id = peer_user_id
 
 
 
@@ -8371,6 +8628,9 @@ class XianyuLive:
                 message_10 = message_1["10"]
                 send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
                 send_user_id = message_10.get("senderUserId", "unknown")
+                order_peer_user_id = self._extract_peer_user_id_from_message(message)
+                if order_peer_user_id:
+                    send_user_id = order_peer_user_id
                 send_message = message_10.get("reminderContent", "")
 
                 chat_id_raw = message_1.get("2", "")
@@ -8572,13 +8832,15 @@ class XianyuLive:
                             logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，无法执行免拼发货')
                             return
 
+                        order_user_id = self._extract_peer_user_id_from_message(message) or send_user_id
+
                         # 更新订单的is_bargain字段为True（标记为小刀订单）
                         try:
                             from db_manager import db_manager
                             db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
-                                buyer_id=send_user_id if str(send_user_id or "").split("@", 1)[0] != str(self.myid or "") else None,
+                                buyer_id=order_user_id if str(order_user_id or "").split("@", 1)[0] != str(self.myid or "") else None,
                                 chat_id=chat_id,
                                 cookie_id=self.cookie_id,
                                 is_bargain=True
@@ -8591,12 +8853,12 @@ class XianyuLive:
                         logger.info(f'[{msg_time}] 【{self.cookie_id}】延迟2秒后执行免拼发货...')
                         await asyncio.sleep(2)
                         # 调用自动免拼发货方法
-                        result = await self.auto_freeshipping(order_id, item_id, send_user_id)
+                        result = await self.auto_freeshipping(order_id, item_id, order_user_id)
                         if result.get('success'):
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 自动免拼发货成功')
                         else:
                             logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 自动免拼发货失败: {result.get("error", "未知错误")}')
-                        await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,
+                        await self._handle_auto_delivery(websocket, message, send_user_name, order_user_id,
                                                        item_id, chat_id, msg_time)
                         return
                     else:

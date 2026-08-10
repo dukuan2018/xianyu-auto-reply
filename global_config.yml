@@ -7,6 +7,8 @@ APP_CONFIG:
   app_key: 444e9908a51d1cb236a27862abc769c9
   app_version: '1.0'
   platform: web
+GOOFISH_CHAT_API:
+  url: http://127.0.0.1:8091/api/goofish/order-event
 AUTO_REPLY:
   api:
     enabled: true  # 禁用API回复，使用AI回复或关键词回复
