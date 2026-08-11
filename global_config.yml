@@ -8,6 +8,7 @@ APP_CONFIG:
   app_version: '1.0'
   platform: web
 GOOFISH_CHAT_API:
+  enabled: true
   url: http://127.0.0.1:8091/api/goofish/order-event
 AUTO_REPLY:
   api:

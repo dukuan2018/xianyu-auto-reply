@@ -25,7 +25,7 @@ from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
-from utils.xianyu_utils import trans_cookies
+from utils.xianyu_utils import trans_cookies, generate_sign
 from utils.image_utils import image_manager
 
 from loguru import logger
@@ -1154,10 +1154,26 @@ class SendImageRequest(BaseModel):
     filename: Optional[str] = "api_image.jpg"
 
 
-class OrderDetailWithBuyerRequest(BaseModel):
+class OrderFullInfoRequest(BaseModel):
     api_key: str
     cookie_id: str
     order_id: str
+
+
+class ModifyPriceRequest(BaseModel):
+    api_key: str
+    cookie_id: str
+    order_id: str
+    modify_fee: str
+    new_transport_fee: Optional[str] = "0"
+
+
+class NotPayOrdersRequest(BaseModel):
+    api_key: str
+    cookie_id: str
+    page_number: Optional[int] = 1
+    page_size: Optional[int] = 20
+    query_code: Optional[str] = "NOT_PAY"
 
 
 class SendMessageResponse(BaseModel):
@@ -1181,6 +1197,236 @@ def verify_api_key(api_key: str) -> bool:
         logger.error(f"验证API秘钥时发生异常: {e}")
         # 异常情况下使用默认秘钥验证
         return api_key == API_SECRET_KEY
+
+
+def clean_api_param(param_value):
+    if isinstance(param_value, str):
+        return param_value.replace('\\n', '').replace('\n', '').strip()
+    return param_value
+
+
+def get_cookie_value_for_open_api(cookie_id: str) -> Optional[str]:
+    cookie_value = None
+    try:
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if live_instance and getattr(live_instance, "cookies_str", None):
+            cookie_value = live_instance.cookies_str
+    except Exception as e:
+        logger.warning(f"get live cookie failed: cookie_id={cookie_id}, error={e}")
+
+    if not cookie_value:
+        cookie_details = db_manager.get_cookie_details(cookie_id)
+        if cookie_details:
+            cookie_value = (
+                cookie_details.get("value")
+                or cookie_details.get("cookie_value")
+                or cookie_details.get("cookies_str")
+            )
+    return cookie_value
+
+
+async def fetch_sold_order_list_by_cookie(
+    cookie_value: str,
+    query_code: str = "NOT_PAY",
+    page_number: int = 1,
+    page_size: int = 20,
+):
+    cookie_dict = trans_cookies(cookie_value)
+    token_value = cookie_dict.get("_m_h5_tk", "")
+    token = token_value.split("_", 1)[0] if token_value else ""
+    if not token:
+        raise ValueError("_m_h5_tk token not found in cookie")
+
+    page_number = max(int(page_number or 1), 1)
+    page_size = min(max(int(page_size or 20), 1), 100)
+    query_code = (query_code or "NOT_PAY").strip() or "NOT_PAY"
+    timestamp = str(int(time.time() * 1000))
+    data_val = json.dumps(
+        {
+            "pageNumber": page_number,
+            "rowsPerPage": page_size,
+            "orderIds": "",
+            "queryCode": query_code,
+            "orderSearchParam": "{}",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    params = {
+        "jsv": "2.7.2",
+        "appKey": "34839810",
+        "t": timestamp,
+        "sign": generate_sign(timestamp, token, data_val),
+        "v": "1.0",
+        "type": "json",
+        "accountSite": "xianyu",
+        "dataType": "json",
+        "timeout": "20000",
+        "api": "mtop.taobao.idle.trade.merchant.sold.get",
+        "valueType": "string",
+        "sessionOption": "AutoLoginOnly",
+        "spm_cnt": "a21107h.42826273.0.0",
+    }
+    headers = {
+        "accept": "application/json",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "content-type": "application/x-www-form-urlencoded",
+        "cookie": cookie_value,
+        "idle_site_biz_code": "COMMONPRO",
+        "origin": "https://seller.goofish.com",
+        "referer": "https://seller.goofish.com/?site=COMMONPRO",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
+    }
+    url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/"
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
+            response_text = await response.text()
+            try:
+                response_body = json.loads(response_text)
+            except Exception:
+                response_body = response_text
+            return response.status, response_body
+
+
+async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str):
+    cookie_dict = trans_cookies(cookie_value)
+    token_value = cookie_dict.get("_m_h5_tk", "")
+    token = token_value.split("_", 1)[0] if token_value else ""
+    if not token:
+        raise ValueError("_m_h5_tk token not found in cookie")
+
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        raise ValueError("order_id is required")
+
+    timestamp = str(int(time.time() * 1000))
+    data_val = json.dumps(
+        {"tid": order_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    params = {
+        "jsv": "2.7.2",
+        "appKey": "34839810",
+        "t": timestamp,
+        "sign": generate_sign(timestamp, token, data_val),
+        "v": "1.0",
+        "type": "json",
+        "accountSite": "xianyu",
+        "dataType": "json",
+        "timeout": "20000",
+        "api": "mtop.taobao.idle.trade.merchant.full.info",
+        "valueType": "string",
+        "sessionOption": "AutoLoginOnly",
+        "spm_cnt": "a21ybx.home.0.0",
+        "spm_pre": "a21107h.42829799.0.0",
+    }
+    headers = {
+        "accept": "application/json",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "content-type": "application/x-www-form-urlencoded",
+        "cookie": cookie_value,
+        "idle_site_biz_code": "COMMONPRO",
+        "origin": "https://seller.goofish.com",
+        "referer": "https://seller.goofish.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
+    }
+    url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/"
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
+            response_text = await response.text()
+            try:
+                response_body = json.loads(response_text)
+            except Exception:
+                response_body = response_text
+            return response.status, response_body
+
+
+def build_order_full_info_summary(response_body: dict) -> dict:
+    module = (
+        response_body.get("data", {})
+        .get("module", {})
+        if isinstance(response_body, dict) else {}
+    )
+    buyer_vo = module.get("merchantBuyerVO") or {}
+    common_data = module.get("merchantCommonData") or {}
+    merchant_price_vo = module.get("merchantPriceVO") or {}
+    order_info_vo = module.get("orderInfoVO") or {}
+    price_info = order_info_vo.get("priceInfo") or {}
+    price_amount = price_info.get("amount") or {}
+    bill_list = price_info.get("billList") or []
+    buyer_id = str(buyer_vo.get("buyerId") or "").split("@", 1)[0].strip()
+    order_id = str(common_data.get("orderId") or "").strip()
+    order_amount = next(
+        (
+            str(value).strip()
+            for value in (
+                price_amount.get("value"),
+                next(
+                    (
+                        bill.get("value")
+                        for bill in bill_list
+                        if isinstance(bill, dict) and bill.get("code") == "ITEM_TOTAL_FEE"
+                    ),
+                    None,
+                ),
+                merchant_price_vo.get("totalPrice"),
+                merchant_price_vo.get("auctionPrice"),
+                common_data.get("actualPayAmount"),
+                common_data.get("payAmount"),
+                common_data.get("orderAmount"),
+                common_data.get("totalAmount"),
+                common_data.get("actualPayMoney"),
+                common_data.get("payMoney"),
+            )
+            if value not in (None, "")
+        ),
+        "",
+    )
+    return {
+        "order_id": order_id,
+        "buyer_id": buyer_id,
+        "buyerId": buyer_id,
+        "item_id": str(common_data.get("itemId") or "").strip(),
+        "itemId": str(common_data.get("itemId") or "").strip(),
+        "order_status": common_data.get("orderStatus") or "",
+        "orderStatus": common_data.get("orderStatus") or "",
+        "create_time": common_data.get("createTime") or "",
+        "pay_success_time": common_data.get("paySuccessTime") or "",
+        "consign_time": common_data.get("consignTime") or "",
+        "buyer_nick": buyer_vo.get("userNick") or buyer_vo.get("name") or "",
+        "order_amount": order_amount,
+        "orderAmount": order_amount,
+        "merchant_price": merchant_price_vo,
+        "merchantPriceVO": merchant_price_vo,
+        "price_info": price_info,
+        "priceInfo": price_info,
+    }
+
+
+def build_sold_order_summary(items: list) -> list:
+    orders = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        common_data = item.get("commonData") or {}
+        buyer_info = item.get("buyerInfoVO") or {}
+        order_id = str(common_data.get("orderId") or "").strip()
+        buyer_id = str(buyer_info.get("buyerId") or "").split("@", 1)[0].strip()
+        orders.append(
+            {
+                "orderId": order_id,
+                "itemId": str(common_data.get("itemId") or "").strip(),
+                "sendUserId": buyer_id,
+                "buyerId": buyer_id,
+                "buyerNick": buyer_info.get("buyerNick") or buyer_info.get("nick") or "",
+                "createTime": common_data.get("createTime"),
+            }
+        )
+    return orders
 
 
 def decode_image_base64(image_base64: str) -> bytes:
@@ -1398,6 +1644,251 @@ async def send_image_api(request: SendImageRequest):
         to_user_id_for_log = request.to_user_id
         logger.error(f"API发送图片异常: {cookie_id_for_log} -> {to_user_id_for_log}, 错误: {str(e)}")
         return SendMessageResponse(success=False, message=f"发送图片失败: {str(e)}")
+
+
+@app.post('/not-pay-orders')
+async def not_pay_orders_api(request: NotPayOrdersRequest):
+    """Fetch current seller NOT_PAY order list."""
+    try:
+        cleaned_api_key = clean_api_param(request.api_key)
+        cleaned_cookie_id = clean_api_param(request.cookie_id)
+        cleaned_query_code = clean_api_param(request.query_code) or "NOT_PAY"
+        page_number = request.page_number or 1
+        page_size = request.page_size or 20
+
+        if not cleaned_api_key:
+            return {"success": False, "message": "api_key is required"}
+        if cleaned_api_key == "mochoo_test_key":
+            return {"success": True, "message": "api key verified", "orders": [], "items": []}
+        if not verify_api_key(cleaned_api_key):
+            logger.warning(f"not-pay-orders api_key verify failed: {cleaned_api_key}")
+            return {"success": False, "message": "api_key verify failed"}
+        if not cleaned_cookie_id:
+            return {"success": False, "message": "cookie_id is required"}
+
+        cookie_value = get_cookie_value_for_open_api(cleaned_cookie_id)
+        if not cookie_value:
+            return {"success": False, "message": "cookie not found"}
+
+        http_status, response_body = await fetch_sold_order_list_by_cookie(
+            cookie_value=cookie_value,
+            query_code=cleaned_query_code,
+            page_number=page_number,
+            page_size=page_size,
+        )
+        items = []
+        if isinstance(response_body, dict):
+            items = (
+                response_body.get("data", {})
+                .get("module", {})
+                .get("items", [])
+            )
+        if not isinstance(items, list):
+            items = []
+        orders = build_sold_order_summary(items)
+
+        logger.info(
+            f"not-pay-orders result: cookie_id={cleaned_cookie_id}, query_code={cleaned_query_code}, "
+            f"page_number={page_number}, page_size={page_size}, count={len(orders)}, http_status={http_status}"
+        )
+        return {
+            "success": http_status == 200,
+            "message": "request finished",
+            "http_status": http_status,
+            "cookie_id": cleaned_cookie_id,
+            "query_code": cleaned_query_code,
+            "page_number": page_number,
+            "page_size": page_size,
+            "orders": orders,
+            "items": items,
+            "data": response_body,
+        }
+
+    except Exception as e:
+        logger.error(f"not-pay-orders failed: cookie_id={request.cookie_id}, error={str(e)}")
+        return {"success": False, "message": f"not pay orders failed: {str(e)}"}
+
+
+@app.post('/order-full-info')
+async def order_full_info_api(request: OrderFullInfoRequest):
+    """Fetch Goofish order full info by order_id."""
+    try:
+        cleaned_api_key = clean_api_param(request.api_key)
+        cleaned_cookie_id = clean_api_param(request.cookie_id)
+        cleaned_order_id = clean_api_param(request.order_id)
+
+        if not cleaned_api_key:
+            return {"success": False, "message": "api_key is required"}
+        if cleaned_api_key == "mochoo_test_key":
+            return {"success": True, "message": "api key verified", "data": {}}
+        if not verify_api_key(cleaned_api_key):
+            logger.warning(f"order-full-info api_key verify failed: {cleaned_api_key}")
+            return {"success": False, "message": "api_key verify failed"}
+        if not cleaned_cookie_id:
+            return {"success": False, "message": "cookie_id is required"}
+        if not cleaned_order_id:
+            return {"success": False, "message": "order_id is required"}
+
+        cookie_value = get_cookie_value_for_open_api(cleaned_cookie_id)
+        if not cookie_value:
+            return {"success": False, "message": "cookie not found"}
+
+        http_status, response_body = await fetch_order_full_info_by_cookie(cookie_value, cleaned_order_id)
+        if not isinstance(response_body, dict):
+            summary = {}
+        else:
+            summary = build_order_full_info_summary(response_body)
+
+        logger.info(
+            f"order-full-info result: cookie_id={cleaned_cookie_id}, order_id={cleaned_order_id}, "
+            f"buyer_id={summary.get('buyer_id', '')}, http_status={http_status}"
+        )
+        return {
+            "success": http_status == 200,
+            "message": "request finished",
+            "http_status": http_status,
+            "cookie_id": cleaned_cookie_id,
+            "order_id": cleaned_order_id,
+            "buyer_id": summary.get("buyer_id", ""),
+            "buyerId": summary.get("buyerId", ""),
+            "item_id": summary.get("item_id", ""),
+            "itemId": summary.get("itemId", ""),
+            "order_status": summary.get("order_status", ""),
+            "orderStatus": summary.get("orderStatus", ""),
+            "order_amount": summary.get("order_amount", ""),
+            "orderAmount": summary.get("orderAmount", ""),
+            "merchant_price": summary.get("merchant_price", {}),
+            "merchantPriceVO": summary.get("merchantPriceVO", {}),
+            "pay_success_time": summary.get("pay_success_time", ""),
+            "data": summary,
+        }
+
+    except Exception as e:
+        logger.error(f"order-full-info failed: cookie_id={request.cookie_id}, order_id={request.order_id}, error={str(e)}")
+        return {"success": False, "message": f"order full info failed: {str(e)}"}
+
+
+@app.post('/modify-price')
+async def modify_price_api(request: ModifyPriceRequest):
+    """Modify a Goofish order price using the saved account cookie."""
+    try:
+        def clean_param(param_str):
+            if isinstance(param_str, str):
+                return param_str.replace('\\n', '').replace('\n', '').strip()
+            return param_str
+
+        cleaned_api_key = clean_param(request.api_key)
+        cleaned_cookie_id = clean_param(request.cookie_id)
+        cleaned_order_id = clean_param(request.order_id)
+        cleaned_modify_fee = clean_param(request.modify_fee)
+        cleaned_transport_fee = clean_param(request.new_transport_fee) or "0"
+
+        if not cleaned_api_key:
+            return {"success": False, "message": "api_key is required"}
+        if cleaned_api_key == "mochoo_test_key":
+            return {"success": True, "message": "api key verified"}
+        if not verify_api_key(cleaned_api_key):
+            logger.warning(f"modify-price api_key verify failed: {cleaned_api_key}")
+            return {"success": False, "message": "api_key verify failed"}
+
+        required_params = {
+            "cookie_id": cleaned_cookie_id,
+            "order_id": cleaned_order_id,
+            "modify_fee": cleaned_modify_fee,
+        }
+        for param_name, param_value in required_params.items():
+            if not param_value:
+                return {"success": False, "message": f"{param_name} is required"}
+
+        cookie_value = None
+        try:
+            from XianyuAutoAsync import XianyuLive
+            live_instance = XianyuLive.get_instance(cleaned_cookie_id)
+            if live_instance and getattr(live_instance, "cookies_str", None):
+                cookie_value = live_instance.cookies_str
+        except Exception as e:
+            logger.warning(f"modify-price get live cookie failed: {cleaned_cookie_id}, {e}")
+
+        if not cookie_value:
+            cookie_details = db_manager.get_cookie_details(cleaned_cookie_id)
+            if cookie_details:
+                cookie_value = (
+                    cookie_details.get("value")
+                    or cookie_details.get("cookie_value")
+                    or cookie_details.get("cookies_str")
+                )
+
+        if not cookie_value:
+            return {"success": False, "message": "cookie not found"}
+
+        cookie_dict = trans_cookies(cookie_value)
+        token_value = cookie_dict.get("_m_h5_tk", "")
+        token = token_value.split("_", 1)[0] if token_value else ""
+        if not token:
+            return {"success": False, "message": "_m_h5_tk token not found in cookie"}
+
+        timestamp = str(int(time.time() * 1000))
+        data_val = json.dumps(
+            {
+                "orderId": cleaned_order_id,
+                "modifyFee": cleaned_modify_fee,
+                "newTransportFee": cleaned_transport_fee,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        sign = generate_sign(timestamp, token, data_val)
+
+        params = {
+            "jsv": "2.7.2",
+            "appKey": "34839810",
+            "t": timestamp,
+            "sign": sign,
+            "v": "1.0",
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": "mtop.taobao.idle.trade.merchant.user.adjust.price",
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": "a21107h.42829799.0.0",
+        }
+        url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.user.adjust.price/1.0/"
+        headers = {
+            "accept": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "content-type": "application/x-www-form-urlencoded",
+            "cookie": cookie_value,
+            "idle_site_biz_code": "COMMONPRO",
+            "origin": "https://seller.goofish.com",
+            "referer": "https://seller.goofish.com/?site=COMMONPRO",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
+        }
+
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
+                response_text = await response.text()
+                http_status = response.status
+                try:
+                    response_body = json.loads(response_text)
+                except Exception:
+                    response_body = response_text
+
+        logger.info(
+            f"modify-price result: cookie_id={cleaned_cookie_id}, order_id={cleaned_order_id}, "
+            f"modify_fee={cleaned_modify_fee}, http_status={http_status}"
+        )
+        return {
+            "success": http_status == 200,
+            "message": "request finished",
+            "http_status": http_status,
+            "data": response_body,
+        }
+
+    except Exception as e:
+        logger.error(f"modify-price failed: cookie_id={request.cookie_id}, order_id={request.order_id}, error={str(e)}")
+        return {"success": False, "message": f"modify price failed: {str(e)}"}
 
 
 @app.post("/xianyu/reply", response_model=ResponseModel)
@@ -6106,71 +6597,6 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
     except Exception as e:
         log_with_user('error', f"查询订单详情失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
-
-
-@app.post('/api/orders/detail-with-buyer')
-async def get_order_detail_with_buyer(request: OrderDetailWithBuyerRequest):
-    """按订单ID获取订单详情，并尝试补充买家ID。"""
-    try:
-        from utils.order_detail_fetcher import fetch_order_detail_simple
-
-        def strip_amount_fields(value):
-            if isinstance(value, dict):
-                return {
-                    key: strip_amount_fields(item)
-                    for key, item in value.items()
-                    if key not in ('amount', 'order_amount')
-                }
-            if isinstance(value, list):
-                return [strip_amount_fields(item) for item in value]
-            return value
-
-        cleaned_api_key = (request.api_key or '').strip()
-        cookie_id = (request.cookie_id or '').strip()
-        order_id = (request.order_id or '').strip()
-
-        if not cleaned_api_key:
-            return JSONResponse(status_code=200, content={"success": False, "message": "API秘钥不能为空"})
-        if cleaned_api_key == "mochoo_test_key":
-            return JSONResponse(status_code=200, content={"success": True, "message": "接口验证成功", "data": {}})
-        if not verify_api_key(cleaned_api_key):
-            return JSONResponse(status_code=200, content={"success": False, "message": "API秘钥验证失败"})
-
-        if not cookie_id or not order_id:
-            return JSONResponse(status_code=200, content={"success": False, "message": "cookie_id 和 order_id 不能为空"})
-
-        logger.info(f"按订单ID获取详情和买家ID: order_id={order_id}, cookie_id={cookie_id}")
-
-        from XianyuAutoAsync import XianyuLive
-        live_instance = XianyuLive.get_instance(cookie_id)
-        if not live_instance:
-            return JSONResponse(status_code=200, content={"success": False, "message": "账号实例不存在或未连接，请先启动账号"})
-        if not getattr(live_instance, 'cookies_str', None):
-            return JSONResponse(status_code=200, content={"success": False, "message": "账号cookie为空，无法拉取订单详情"})
-
-        detail = await fetch_order_detail_simple(
-            order_id,
-            live_instance.cookies_str,
-            headless=True,
-            use_cache=False
-        )
-        if not detail:
-            return JSONResponse(status_code=200, content={"success": False, "message": "拉取订单详情失败"})
-
-        response_detail = strip_amount_fields(detail)
-        return {
-            "success": True,
-            "data": {
-                "order_id": order_id,
-                "cookie_id": cookie_id,
-                "buyer_id": response_detail.get('buyer_id', '') if isinstance(response_detail, dict) else '',
-                "detail": response_detail
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"按订单ID获取详情和买家ID失败: {str(e)}")
-        return JSONResponse(status_code=200, content={"success": False, "message": f"获取订单详情失败: {str(e)}"})
 
 
 @app.delete('/api/orders/{order_id}')

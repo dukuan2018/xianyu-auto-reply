@@ -833,6 +833,8 @@ class XianyuLive:
         # 待确认发货队列（Token过期时暂存订单，刷新成功后重试）
         self.pending_confirm_orders = []  # [(order_id, item_id, add_time), ...]
         self.pending_confirm_lock = asyncio.Lock()
+        self._not_pay_list_fallback_last_at = 0
+        self._not_pay_list_fallback_lock = asyncio.Lock()
 
         # 滑块验证相关
         self.captcha_verification_count = 0  # 滑块验证次数计数器
@@ -3245,7 +3247,7 @@ class XianyuLive:
 
             playwright = await async_playwright().start()
 
-            # 启动浏览器（参照order_detail_fetcher的配置）
+            # 启动浏览器用于登录或风控验证
             browser_args = [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -4328,7 +4330,7 @@ class XianyuLive:
             status_text = " ".join([reminder_content, reminder_title, reminder_notice, red_reminder, detail_notice, biz_tag])
 
             if "我已修改价格，等待你付款" in message_text:
-                return ""
+                return "price_modified_pending_payment"
             if "我已拍下，待付款" in status_text or "等待买家付款" in status_text:
                 return "pending_payment"
             if (
@@ -4343,6 +4345,249 @@ class XianyuLive:
             logger.debug(f"【{self.cookie_id}】识别订单推送状态失败: {self._safe_str(e)}")
             return ""
 
+    async def fetch_sold_order_list(self, query_code: str = "NOT_PAY", page_number: int = 1, rows_per_page: int = 20):
+        """Fetch seller sold orders from Goofish mtop API."""
+        try:
+            token_value = trans_cookies(self.cookies_str).get("_m_h5_tk", "")
+            token = token_value.split("_", 1)[0] if token_value else ""
+            if not token:
+                logger.warning(f"【{self.cookie_id}】sold order list skipped: _m_h5_tk missing")
+                return []
+
+            timestamp = str(int(time.time() * 1000))
+            data_val = json.dumps(
+                {
+                    "pageNumber": page_number,
+                    "rowsPerPage": rows_per_page,
+                    "orderIds": "",
+                    "queryCode": query_code,
+                    "orderSearchParam": "{}",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            params = {
+                "jsv": "2.7.2",
+                "appKey": "34839810",
+                "t": timestamp,
+                "sign": generate_sign(timestamp, token, data_val),
+                "v": "1.0",
+                "type": "json",
+                "accountSite": "xianyu",
+                "dataType": "json",
+                "timeout": "20000",
+                "api": "mtop.taobao.idle.trade.merchant.sold.get",
+                "valueType": "string",
+                "sessionOption": "AutoLoginOnly",
+                "spm_cnt": "a21107h.42826273.0.0",
+            }
+            headers = {
+                "accept": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "content-type": "application/x-www-form-urlencoded",
+                "cookie": self.cookies_str,
+                "idle_site_biz_code": "COMMONPRO",
+                "origin": "https://seller.goofish.com",
+                "referer": "https://seller.goofish.com/?site=COMMONPRO",
+                "user-agent": DEFAULT_HEADERS.get("user-agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/"
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
+                    response_text = await response.text()
+                    if response.status != 200:
+                        logger.warning(
+                            f"【{self.cookie_id}】sold order list failed: HTTP {response.status}, "
+                            f"response={response_text[:300]}"
+                        )
+                        return []
+                    try:
+                        response_json = json.loads(response_text)
+                    except Exception:
+                        logger.warning(f"【{self.cookie_id}】sold order list invalid json: {response_text[:300]}")
+                        return []
+
+            items = (
+                response_json.get("data", {})
+                .get("module", {})
+                .get("items", [])
+            )
+            if not isinstance(items, list):
+                return []
+            logger.info(f"【{self.cookie_id}】sold order list fetched: query_code={query_code}, count={len(items)}")
+            return items
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】sold order list exception: {self._safe_str(e)}")
+            return []
+
+    async def fetch_order_full_info(self, order_id: str):
+        """Fetch order detail from Goofish mtop full.info API; Playwright detail fetch is disabled."""
+        try:
+            token_value = trans_cookies(self.cookies_str).get("_m_h5_tk", "")
+            token = token_value.split("_", 1)[0] if token_value else ""
+            if not token:
+                logger.warning(f"【{self.cookie_id}】order full info skipped: _m_h5_tk missing")
+                return None
+
+            order_id = str(order_id or "").strip()
+            if not order_id:
+                return None
+
+            timestamp = str(int(time.time() * 1000))
+            data_val = json.dumps(
+                {"tid": order_id},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            params = {
+                "jsv": "2.7.2",
+                "appKey": "34839810",
+                "t": timestamp,
+                "sign": generate_sign(timestamp, token, data_val),
+                "v": "1.0",
+                "type": "json",
+                "accountSite": "xianyu",
+                "dataType": "json",
+                "timeout": "20000",
+                "api": "mtop.taobao.idle.trade.merchant.full.info",
+                "valueType": "string",
+                "sessionOption": "AutoLoginOnly",
+                "spm_cnt": "a21ybx.home.0.0",
+                "spm_pre": "a21107h.42829799.0.0",
+            }
+            headers = {
+                "accept": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "content-type": "application/x-www-form-urlencoded",
+                "cookie": self.cookies_str,
+                "idle_site_biz_code": "COMMONPRO",
+                "origin": "https://seller.goofish.com",
+                "referer": "https://seller.goofish.com/",
+                "user-agent": DEFAULT_HEADERS.get("user-agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/"
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
+                    response_text = await response.text()
+                    if response.status != 200:
+                        logger.warning(
+                            f"【{self.cookie_id}】order full info failed: HTTP {response.status}, "
+                            f"order_id={order_id}, response={response_text[:300]}"
+                        )
+                        return None
+                    try:
+                        response_json = json.loads(response_text)
+                    except Exception:
+                        logger.warning(f"【{self.cookie_id}】order full info invalid json: {response_text[:300]}")
+                        return None
+
+            module = response_json.get("data", {}).get("module", {}) if isinstance(response_json, dict) else {}
+            buyer_vo = module.get("merchantBuyerVO") or {}
+            common_data = module.get("merchantCommonData") or {}
+            merchant_price_vo = module.get("merchantPriceVO") or {}
+            order_info_vo = module.get("orderInfoVO") or {}
+            price_info = order_info_vo.get("priceInfo") or {}
+            price_amount = price_info.get("amount") or {}
+            bill_list = price_info.get("billList") or []
+            buyer_id = str(buyer_vo.get("buyerId") or "").split("@", 1)[0].strip()
+            full_item_id = str(common_data.get("itemId") or "").strip()
+            order_amount = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        price_amount.get("value"),
+                        next(
+                            (
+                                bill.get("value")
+                                for bill in bill_list
+                                if isinstance(bill, dict) and bill.get("code") == "ITEM_TOTAL_FEE"
+                            ),
+                            None,
+                        ),
+                        merchant_price_vo.get("totalPrice"),
+                        merchant_price_vo.get("auctionPrice"),
+                        common_data.get("actualPayAmount"),
+                        common_data.get("payAmount"),
+                        common_data.get("orderAmount"),
+                        common_data.get("totalAmount"),
+                        common_data.get("actualPayMoney"),
+                        common_data.get("payMoney"),
+                    )
+                    if value not in (None, "")
+                ),
+                "",
+            )
+            logger.info(
+                f"【{self.cookie_id}】order full info fetched: order_id={order_id}, "
+                f"buyer_id={buyer_id}, item_id={full_item_id}, "
+                f"amount={order_amount}, status={common_data.get('orderStatus') or ''}"
+            )
+            return {
+                "order_id": str(common_data.get("orderId") or order_id),
+                "buyer_id": buyer_id,
+                "item_id": full_item_id,
+                "order_status": common_data.get("orderStatus") or "",
+                "create_time": common_data.get("createTime") or "",
+                "pay_success_time": common_data.get("paySuccessTime") or "",
+                "consign_time": common_data.get("consignTime") or "",
+                "buyer_nick": buyer_vo.get("userNick") or buyer_vo.get("name") or "",
+                "amount": order_amount,
+                "order_amount": order_amount,
+                "orderAmount": order_amount,
+                "merchant_price": merchant_price_vo,
+                "merchantPriceVO": merchant_price_vo,
+                "price_info": price_info,
+                "priceInfo": price_info,
+            }
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】order full info exception: {self._safe_str(e)}")
+            return None
+
+    async def push_not_pay_orders_from_sold_list(self, trigger_message: dict = None):
+        """Fallback push NOT_PAY orders; sendUserId must come from buyerInfoVO.buyerId."""
+        async with self._not_pay_list_fallback_lock:
+            now = time.time()
+            if now - self._not_pay_list_fallback_last_at < 15:
+                logger.info(f"【{self.cookie_id}】NOT_PAY list fallback skipped by cooldown")
+                return 0
+            self._not_pay_list_fallback_last_at = now
+
+            items = await self.fetch_sold_order_list(query_code="NOT_PAY", page_number=1, rows_per_page=20)
+            pushed_count = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                common_data = item.get("commonData") or {}
+                buyer_info = item.get("buyerInfoVO") or {}
+                order_id = str(common_data.get("orderId") or "").strip()
+                item_id = str(common_data.get("itemId") or "").strip()
+                buyer_id = str(buyer_info.get("buyerId") or "").strip()
+                if not order_id or not buyer_id:
+                    logger.warning(
+                        f"【{self.cookie_id}】NOT_PAY fallback skip invalid order: "
+                        f"order_id={order_id}, buyer_id={buyer_id}, item_id={item_id}"
+                    )
+                    continue
+
+                logger.info(
+                    f"【{self.cookie_id}】NOT_PAY fallback push: order_id={order_id}, "
+                    f"sendUserId={buyer_id}, item_id={item_id}"
+                )
+                if await self.push_goofish_order_event_to_java(
+                    order_id=order_id,
+                    chat_id="",
+                    user_id=buyer_id,
+                    buyer_id=buyer_id,
+                    item_id=item_id,
+                    order_status="pending_payment",
+                    message=trigger_message if isinstance(trigger_message, dict) else None,
+                ):
+                    pushed_count += 1
+            logger.info(f"【{self.cookie_id}】NOT_PAY fallback finished: pushed={pushed_count}, total={len(items)}")
+            return pushed_count
+
     async def push_goofish_order_event_to_java(
         self,
         order_id: str,
@@ -4351,11 +4596,26 @@ class XianyuLive:
         item_id: str,
         order_status: str,
         message: dict = None,
+        buyer_id: str = None,
     ):
         """将闲鱼订单事件推送给Java后台。"""
         try:
             from db_manager import db_manager
             import aiohttp
+
+            push_enabled = (GOOFISH_CHAT_API or {}).get("enabled", True)
+            if isinstance(push_enabled, str):
+                push_enabled = push_enabled.strip().lower() not in {"false", "0", "no", "off"}
+            if not push_enabled:
+                logger.info(
+                    f"【{self.cookie_id}】GOOFISH_CHAT_API.enabled=false，跳过订单事件推送: "
+                    f"order_id={order_id}, status={order_status}"
+                )
+                self._log_order_event_diag(
+                    "skip", message, order_id, order_status, chat_id, user_id,
+                    item_id, reason="push_disabled"
+                )
+                return False
 
             if not order_id or not order_status:
                 return False
@@ -4388,12 +4648,15 @@ class XianyuLive:
                 )
                 return False
 
-            resolved_user_id = self._extract_peer_user_id_from_message(message) if isinstance(message, dict) else None
+            resolved_user_id = str(user_id or "").split("@", 1)[0].strip()
+            resolved_buyer_id = str(buyer_id or "").split("@", 1)[0].strip()
             if not resolved_user_id:
-                logger.warning(f"【{self.cookie_id}】订单事件缺少peerUserId，跳过推送: order_id={order_id}, status={order_status}")
+                resolved_user_id = self._extract_peer_user_id_from_message(message) if isinstance(message, dict) else None
+            if not resolved_user_id:
+                logger.warning(f"【{self.cookie_id}】订单事件缺少sendUserId，跳过推送: order_id={order_id}, status={order_status}")
                 self._log_order_event_diag(
                     "skip", message, order_id, order_status, chat_id, user_id,
-                    item_id, reason="peer_user_id_missing", level="warning"
+                    item_id, reason="send_user_id_missing", level="warning"
                 )
                 return False
 
@@ -4409,6 +4672,7 @@ class XianyuLive:
             payload = {
                 "orderId": str(order_id or ""),
                 "sendUserId": str(resolved_user_id or ""),
+                "buyerId": str(resolved_buyer_id or ""),
                 "itemId": str(item_id or ""),
                 "goofishShopId": str(self.cookie_id or ""),
                 "goofishChatId": str(chat_id or ""),
@@ -5268,7 +5532,7 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】免拼发货模块调用失败: {self._safe_str(e)}")
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
-    async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, chat_id: str = None, debug_headless: bool = None):
+    async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, chat_id: str = None):
         """获取订单详情信息，同一订单只尝试一次。"""
         if order_id in self._order_detail_fetch_attempts:
             logger.info(
@@ -5296,31 +5560,18 @@ class XianyuLive:
             try:
                 logger.info(f"【{self.cookie_id}】开始获取订单详情: {order_id}")
 
-                # 导入订单详情获取器
-                from utils.order_detail_fetcher import fetch_order_detail_simple
                 from db_manager import db_manager
 
-                # 获取当前账号的cookie字符串
-                cookie_string = self.cookies_str
-                logger.warning(f"【{self.cookie_id}】使用Cookie长度: {len(cookie_string) if cookie_string else 0}")
-
-                # 确定是否使用有头模式（调试用）
-                headless_mode = True if debug_headless is None else debug_headless
-                if not headless_mode:
-                    logger.info(f"【{self.cookie_id}】🖥️ 启用有头模式进行调试")
-
-                # 异步获取订单详情（使用当前账号的cookie）
-                result = await fetch_order_detail_simple(order_id, cookie_string, headless=headless_mode)
+                result = await self.fetch_order_full_info(order_id)
 
                 if result:
                     logger.info(f"【{self.cookie_id}】订单详情获取成功: {order_id}")
-                    logger.info(f"【{self.cookie_id}】页面标题: {result.get('title', '未知')}")
-
                     # 获取解析后的规格信息
                     spec_name = result.get('spec_name', '')
                     spec_value = result.get('spec_value', '')
                     quantity = result.get('quantity', '')
                     detail_buyer_id = result.get('buyer_id') or buyer_id
+                    detail_item_id = result.get('item_id') or item_id
 
                     if spec_name and spec_value:
                         logger.info(f"【{self.cookie_id}】📋 规格名称: {spec_name}")
@@ -5340,12 +5591,13 @@ class XianyuLive:
                             # 先保存订单基本信息
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
-                                item_id=item_id,
+                                item_id=detail_item_id,
                                 buyer_id=detail_buyer_id if str(detail_buyer_id or "").split("@", 1)[0] != str(self.myid or "") else None,
                                 chat_id=chat_id,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
                                 quantity=quantity,
+                                amount=result.get("order_amount") or None,
                                 cookie_id=self.cookie_id
                             )
                             
@@ -9000,6 +9252,8 @@ class XianyuLive:
                                             cookie_id=self.cookie_id,
                                             msg_time=msg_time
                                         )
+                                        if red_reminder == "等待买家付款":
+                                            await self.push_not_pay_orders_from_sold_list(trigger_message=message)
                                     except Exception as e:
                                         logger.error(f"【{self.cookie_id}】处理红色提醒消息失败: {self._safe_str(e)}")
                         except Exception as red_e:
