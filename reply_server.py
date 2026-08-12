@@ -838,22 +838,29 @@ def cleanup_expired_geetest_status():
         del geetest_status_store[k]
 
 
-def set_geetest_status(challenge: str, status: int):
+def set_geetest_status(challenge: str, status: int, mode: Optional[str] = None):
     """设置极验验证状态"""
     cleanup_expired_geetest_status()
+    old_record = geetest_status_store.get(challenge) or {}
     geetest_status_store[challenge] = {
         "status": status,
+        "mode": mode or old_record.get("mode") or "failover",
         "expires_at": time.time() + 300  # 5分钟有效
     }
 
 
-def get_geetest_status(challenge: str) -> int:
-    """获取极验验证状态，返回0表示未验证或已过期"""
+def get_geetest_record(challenge: str) -> dict:
+    """获取极验验证记录"""
     cleanup_expired_geetest_status()
     stored = geetest_status_store.get(challenge)
     if stored and stored["expires_at"] > time.time():
-        return stored["status"]
-    return 0
+        return stored
+    return {}
+
+
+def get_geetest_status(challenge: str) -> int:
+    """获取极验验证状态，返回0表示未验证或已过期"""
+    return int(get_geetest_record(challenge).get("status") or 0)
 
 
 class GeetestRegisterResponse(BaseModel):
@@ -897,7 +904,7 @@ async def geetest_register():
         # 记录初始状态
         challenge = data.get("challenge", "")
         if challenge:
-            set_geetest_status(challenge, 0)
+            set_geetest_status(challenge, 0, "normal" if result.status == 1 else "failover")
         
         return GeetestRegisterResponse(
             success=True,
@@ -918,7 +925,7 @@ async def geetest_register():
             # 记录初始状态
             challenge = data.get("challenge", "")
             if challenge:
-                set_geetest_status(challenge, 0)
+                set_geetest_status(challenge, 0, "failover")
             
             return GeetestRegisterResponse(
                 success=True,
@@ -943,8 +950,10 @@ async def geetest_validate(request: GeetestValidateRequest):
     用户完成滑动验证后，前端调用此接口进行二次验证
     """
     try:
+        geetest_record = get_geetest_record(request.challenge)
+
         # 检查是否已经验证过
-        if get_geetest_status(request.challenge) == 1:
+        if int(geetest_record.get("status") or 0) == 1:
             return GeetestValidateResponse(
                 success=True,
                 code=200,
@@ -955,9 +964,8 @@ async def geetest_validate(request: GeetestValidateRequest):
         
         gt_lib = GeetestLib()
         
-        # 判断是正常模式还是宕机模式
-        # 通过challenge长度判断：正常模式challenge是32位MD5，宕机模式是UUID
-        is_normal_mode = len(request.challenge) == 32
+        # 根据register阶段记录的模式判断。正常MD5 challenge和本地UUID hex都是32位，不能用长度区分。
+        is_normal_mode = geetest_record.get("mode") == "normal"
         
         if is_normal_mode:
             result = await gt_lib.success_validate(
@@ -974,7 +982,7 @@ async def geetest_validate(request: GeetestValidateRequest):
         
         if result.status == 1:
             # 记录验证通过状态
-            set_geetest_status(request.challenge, 1)
+            set_geetest_status(request.challenge, 1, geetest_record.get("mode"))
             
             return GeetestValidateResponse(
                 success=True,
@@ -1207,23 +1215,52 @@ def clean_api_param(param_value):
 
 def get_cookie_value_for_open_api(cookie_id: str) -> Optional[str]:
     cookie_value = None
+    db_cookie_value = None
+    live_cookie_value = None
+
+    cookie_details = db_manager.get_cookie_details(cookie_id)
+    if cookie_details:
+        db_cookie_value = (
+            cookie_details.get("value")
+            or cookie_details.get("cookie_value")
+            or cookie_details.get("cookies_str")
+        )
+
     try:
         from XianyuAutoAsync import XianyuLive
         live_instance = XianyuLive.get_instance(cookie_id)
         if live_instance and getattr(live_instance, "cookies_str", None):
-            cookie_value = live_instance.cookies_str
+            live_cookie_value = live_instance.cookies_str
     except Exception as e:
         logger.warning(f"get live cookie failed: cookie_id={cookie_id}, error={e}")
 
-    if not cookie_value:
-        cookie_details = db_manager.get_cookie_details(cookie_id)
-        if cookie_details:
-            cookie_value = (
-                cookie_details.get("value")
-                or cookie_details.get("cookie_value")
-                or cookie_details.get("cookies_str")
-            )
+    # 开放API优先使用数据库最新CK，避免运行中实例持有旧CK导致签名成功但数据为空。
+    cookie_value = db_cookie_value or live_cookie_value
     return cookie_value
+
+
+def mask_cookie_value_for_log(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 10:
+        return value[:2] + "***" + value[-2:]
+    return value[:6] + "..." + value[-4:]
+
+
+def log_open_api_cookie_diag(cookie_id: str, cookie_value: str, order_id: str, stage: str):
+    try:
+        cookie_dict = trans_cookies(cookie_value or "")
+        logger.info(
+            f"order-full-info cookie diag({stage}): cookie_id={cookie_id}, order_id={order_id}, "
+            f"cookie_len={len(cookie_value or '')}, "
+            f"_m_h5_tk={mask_cookie_value_for_log(cookie_dict.get('_m_h5_tk', ''))}, "
+            f"cookie2={mask_cookie_value_for_log(cookie_dict.get('cookie2', ''))}, "
+            f"_tb_token_={mask_cookie_value_for_log(cookie_dict.get('_tb_token_', ''))}, "
+            f"unb={cookie_dict.get('unb', '')}, tracknick={cookie_dict.get('tracknick', '')}"
+        )
+    except Exception as e:
+        logger.warning(f"order-full-info cookie diag failed: cookie_id={cookie_id}, error={e}")
 
 
 async def fetch_sold_order_list_by_cookie(
@@ -1290,7 +1327,7 @@ async def fetch_sold_order_list_by_cookie(
             return response.status, response_body
 
 
-async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str):
+async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str, cookie_id: str = "", stage: str = "direct"):
     cookie_dict = trans_cookies(cookie_value)
     token_value = cookie_dict.get("_m_h5_tk", "")
     token = token_value.split("_", 1)[0] if token_value else ""
@@ -1321,7 +1358,7 @@ async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str):
         "valueType": "string",
         "sessionOption": "AutoLoginOnly",
         "spm_cnt": "a21ybx.home.0.0",
-        "spm_pre": "a21107h.42829799.0.0",
+        "spm_pre": "a21107h.42829827.0.0",
     }
     headers = {
         "accept": "application/json",
@@ -1329,10 +1366,13 @@ async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str):
         "content-type": "application/x-www-form-urlencoded",
         "cookie": cookie_value,
         "idle_site_biz_code": "COMMONPRO",
+        "idle_user_group_member_id": "",
         "origin": "https://seller.goofish.com",
         "referer": "https://seller.goofish.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
     }
+    if cookie_id:
+        log_open_api_cookie_diag(cookie_id, cookie_value, order_id, stage)
     url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/"
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1343,6 +1383,13 @@ async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str):
             except Exception:
                 response_body = response_text
             return response.status, response_body
+
+
+def is_order_full_info_empty(response_body: dict) -> bool:
+    if not isinstance(response_body, dict):
+        return True
+    module = response_body.get("data", {}).get("module", {})
+    return not isinstance(module, dict) or not module
 
 
 def build_order_full_info_summary(response_body: dict) -> dict:
@@ -1729,22 +1776,64 @@ async def order_full_info_api(request: OrderFullInfoRequest):
         if not cleaned_order_id:
             return {"success": False, "message": "order_id is required"}
 
-        cookie_value = get_cookie_value_for_open_api(cleaned_cookie_id)
-        if not cookie_value:
-            return {"success": False, "message": "cookie not found"}
+        response_body = None
+        http_status = 0
+        used_live_instance = False
+        try:
+            from XianyuAutoAsync import XianyuLive
+            live_instance = XianyuLive.get_instance(cleaned_cookie_id)
+        except Exception as e:
+            live_instance = None
+            logger.warning(f"order-full-info get live instance failed: cookie_id={cleaned_cookie_id}, error={e}")
 
-        http_status, response_body = await fetch_order_full_info_by_cookie(cookie_value, cleaned_order_id)
-        if not isinstance(response_body, dict):
-            summary = {}
+        if live_instance:
+            used_live_instance = True
+            summary = await live_instance.fetch_order_full_info(cleaned_order_id)
+            if summary:
+                summary.setdefault("buyerId", summary.get("buyer_id", ""))
+                summary.setdefault("itemId", summary.get("item_id", ""))
+                summary.setdefault("orderStatus", summary.get("order_status", ""))
+                summary.setdefault("orderAmount", summary.get("order_amount", ""))
+                summary.setdefault("merchantPriceVO", summary.get("merchant_price", {}))
+                summary.setdefault("priceInfo", summary.get("price_info", {}))
+            http_status = 200 if summary else 0
+            response_body = {"data": {"module": {}}} if not summary else None
         else:
-            summary = build_order_full_info_summary(response_body)
+            cookie_value = get_cookie_value_for_open_api(cleaned_cookie_id)
+            if not cookie_value:
+                return {"success": False, "message": "cookie not found"}
+
+            http_status, response_body = await fetch_order_full_info_by_cookie(
+                cookie_value,
+                cleaned_order_id,
+                cookie_id=cleaned_cookie_id,
+                stage="initial",
+            )
+            if is_order_full_info_empty(response_body):
+                ret_value = response_body.get("ret", []) if isinstance(response_body, dict) else []
+                data_value = response_body.get("data", {}) if isinstance(response_body, dict) else {}
+                data_keys = list(data_value.keys()) if isinstance(data_value, dict) else []
+                logger.warning(
+                    f"order-full-info empty module: cookie_id={cleaned_cookie_id}, "
+                    f"order_id={cleaned_order_id}, ret={ret_value}, data_keys={data_keys}"
+                )
+                latest_cookie_value = get_cookie_value_for_open_api(cleaned_cookie_id)
+                if latest_cookie_value and latest_cookie_value != cookie_value:
+                    http_status, response_body = await fetch_order_full_info_by_cookie(
+                        latest_cookie_value,
+                        cleaned_order_id,
+                        cookie_id=cleaned_cookie_id,
+                        stage="retry_with_latest_db_cookie",
+                    )
+
+            summary = {} if is_order_full_info_empty(response_body) else build_order_full_info_summary(response_body)
 
         logger.info(
             f"order-full-info result: cookie_id={cleaned_cookie_id}, order_id={cleaned_order_id}, "
-            f"buyer_id={summary.get('buyer_id', '')}, http_status={http_status}"
+            f"buyer_id={summary.get('buyer_id', '')}, http_status={http_status}, live_instance={used_live_instance}"
         )
         return {
-            "success": http_status == 200,
+            "success": http_status == 200 and bool(summary),
             "message": "request finished",
             "http_status": http_status,
             "cookie_id": cleaned_cookie_id,
@@ -2414,6 +2503,11 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 cookies_str = '; '.join([f"{k}={v}" for k, v in cookies_dict.items()])
                 
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
+                try:
+                    from XianyuAutoAsync import XianyuLive
+                    XianyuLive.mark_interactive_login(account_id, "password")
+                except Exception as mark_err:
+                    log_with_user('debug', f"标记账号密码登录时间失败（不影响登录）: {str(mark_err)}", current_user)
                 
                 # 检查是否已存在相同账号ID的Cookie
                 existing_cookies = db_manager.get_all_cookies(user_id)
@@ -2431,6 +2525,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 )
                 
                 if update_success:
+                    db_manager.save_cookie_status(account_id, True)
                     if is_new_account:
                         log_with_user('info', f"新账号Cookie和账号密码已保存: {account_id}", current_user)
                     else:
@@ -2444,6 +2539,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 if cookie_manager.manager:
                     # 更新内存中的cookie值
                     cookie_manager.manager.cookies[account_id] = cookies_str
+                    cookie_manager.manager.cookie_status[account_id] = True
                     log_with_user('info', f"已更新cookie_manager中的Cookie（内存）: {account_id}", current_user)
                     
                     # 如果是新账号，需要启动任务
@@ -3004,6 +3100,11 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 
             if refresh_success:
                 log_with_user('info', f"扫码登录真实cookie获取成功: {account_id}", current_user)
+                try:
+                    from XianyuAutoAsync import XianyuLive
+                    XianyuLive.mark_interactive_login(account_id, "qr")
+                except Exception as mark_err:
+                    log_with_user('debug', f"标记扫码登录时间失败（不影响登录）: {str(mark_err)}", current_user)
 
                 # 从数据库获取刚刚保存的真实cookie
                 updated_cookie_info = db_manager.get_cookie_by_id(account_id)
@@ -3120,6 +3221,11 @@ async def refresh_cookies_from_qr_login(
 
         if success:
             log_with_user('info', f"扫码cookie刷新成功: {cookie_id}", current_user)
+            try:
+                from XianyuAutoAsync import XianyuLive
+                XianyuLive.mark_interactive_login(cookie_id, "qr")
+            except Exception as mark_err:
+                log_with_user('debug', f"标记扫码登录时间失败（不影响登录）: {str(mark_err)}", current_user)
 
             # 如果cookie_manager存在，更新其中的cookie
             if cookie_manager.manager:

@@ -384,6 +384,31 @@ export function Settings() {
                 </div>
                 <p className="text-xs text-slate-400 mt-1">用于 /send-message 和 /send-image 接口的 api_key 验证</p>
               </div>
+              <div className="flex items-center justify-between py-3 border-t border-slate-100 dark:border-slate-700">
+                <div>
+                  <label className="input-label mb-1">闲鱼订单事件推送</label>
+                  <p className="text-xs text-slate-400">控制 chatNodify 订单状态推送，保存后立即生效</p>
+                </div>
+                <label className="switch-ios">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(settings?.goofish_chat_api_enabled ?? false)}
+                    onChange={(e) => setSettings(s => s ? { ...s, goofish_chat_api_enabled: e.target.checked } : null)}
+                  />
+                  <span className="switch-slider"></span>
+                </label>
+              </div>
+              <div className="input-group">
+                <label className="input-label">闲鱼订单事件推送地址</label>
+                <input
+                  type="text"
+                  value={settings?.goofish_chat_api_url || ''}
+                  onChange={(e) => setSettings(s => s ? { ...s, goofish_chat_api_url: e.target.value } : null)}
+                  placeholder="https://console.yidaw.cn/prod-api/xianyu/chatNodify"
+                  className="input-ios"
+                />
+                <p className="text-xs text-slate-400 mt-1">用于 pending_payment、price_modified_pending_payment、paid 订单事件推送</p>
+              </div>
             </div>
           </div>
 

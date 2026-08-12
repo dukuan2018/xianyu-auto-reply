@@ -195,6 +195,8 @@ export interface SystemSettings {
   smtp_use_ssl?: boolean
   // API安全
   qq_reply_secret_key?: string
+  goofish_chat_api_enabled?: boolean
+  goofish_chat_api_url?: string
   [key: string]: unknown
 }
 

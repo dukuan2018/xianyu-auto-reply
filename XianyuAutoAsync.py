@@ -179,6 +179,7 @@ class XianyuLive:
     # 类级别的实例管理字典，用于API调用
     _instances = {}  # {cookie_id: XianyuLive实例}
     _instances_lock = asyncio.Lock()
+    _interactive_login_times = {}  # {cookie_id: {"time": timestamp, "source": str}}
 
     # 类级别消息去重：防止同一个账号被意外启动多个监听实例时重复处理同一条消息
     _global_processed_message_ids = {}
@@ -198,6 +199,45 @@ class XianyuLive:
                 return repr(e)
             except:
                 return "未知错误"
+
+    def _mask_cookie_value(self, value: str) -> str:
+        """脱敏显示Cookie关键字段，避免日志输出完整CK。"""
+        value = str(value or "")
+        if not value:
+            return ""
+        if len(value) <= 10:
+            return value[:2] + "***" + value[-2:]
+        return value[:6] + "..." + value[-4:]
+
+    def _log_order_full_info_cookie_diag(self, cookie_value: str, order_id: str, stage: str):
+        try:
+            cookie_dict = trans_cookies(cookie_value or "")
+            logger.info(
+                f"【{self.cookie_id}】order full info cookie diag({stage}): "
+                f"order_id={order_id}, cookie_len={len(cookie_value or '')}, "
+                f"_m_h5_tk={self._mask_cookie_value(cookie_dict.get('_m_h5_tk', ''))}, "
+                f"cookie2={self._mask_cookie_value(cookie_dict.get('cookie2', ''))}, "
+                f"_tb_token_={self._mask_cookie_value(cookie_dict.get('_tb_token_', ''))}, "
+                f"unb={cookie_dict.get('unb', '')}, tracknick={cookie_dict.get('tracknick', '')}"
+            )
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】order full info cookie diag failed: {self._safe_str(e)}")
+
+    def _reload_latest_cookie_from_db(self, reason: str = "") -> bool:
+        """从数据库重新加载最新CK，避免运行中的实例继续拿旧CK请求。"""
+        try:
+            cookie_info = db_manager.get_cookie_by_id(self.cookie_id)
+            latest_cookie = ""
+            if cookie_info:
+                latest_cookie = cookie_info.get("value") or cookie_info.get("cookies_str") or ""
+            if latest_cookie and latest_cookie != self.cookies_str:
+                self.cookies_str = latest_cookie
+                self.cookies = trans_cookies(self.cookies_str)
+                logger.warning(f"【{self.cookie_id}】已从数据库重新加载最新Cookie: {reason}")
+                return True
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】重新加载数据库Cookie失败: {self._safe_str(e)}")
+        return False
 
     def _set_connection_state(self, new_state: ConnectionState, reason: str = ""):
         """设置连接状态并记录日志"""
@@ -464,6 +504,9 @@ class XianyuLive:
 
     def _calculate_retry_delay(self, error_msg: str) -> int:
         """根据错误类型和失败次数计算重试延迟"""
+        if self._is_auth_blocked():
+            return self._get_auth_block_remaining()
+
         # WebSocket意外断开 - 短延迟
         if "no close frame received or sent" in error_msg:
             return min(3 * self.connection_failures, 15)
@@ -475,6 +518,50 @@ class XianyuLive:
         # 其他未知错误 - 中等延迟
         else:
             return min(5 * self.connection_failures, 30)
+
+    def _is_auth_blocked(self) -> bool:
+        return time.time() < getattr(self, "auth_blocked_until", 0)
+
+    def _get_auth_block_remaining(self) -> int:
+        return max(1, int(getattr(self, "auth_blocked_until", 0) - time.time()))
+
+    def _mark_auth_blocked(self, reason: str, cooldown_seconds: int = None):
+        cooldown = cooldown_seconds or self.auth_block_cooldown
+        self.auth_blocked_until = time.time() + cooldown
+        self.auth_block_reason = reason
+        self.last_token_refresh_status = "auth_blocked"
+        logger.warning(
+            f"[AUTH_BLOCKED] {self.cookie_id}: {reason}; "
+            f"pause token/captcha/login retry for {cooldown} seconds"
+        )
+
+    def _clear_auth_blocked(self):
+        if getattr(self, "auth_blocked_until", 0):
+            logger.info(f"[AUTH_BLOCKED] {self.cookie_id}: cleared")
+        self.auth_blocked_until = 0
+        self.auth_block_reason = ""
+
+    @classmethod
+    def mark_interactive_login(cls, cookie_id: str, source: str = "manual"):
+        if not cookie_id:
+            return
+        cls._interactive_login_times[str(cookie_id)] = {
+            "time": time.time(),
+            "source": source or "manual"
+        }
+        logger.info(f"[AUTH_BLOCKED] {cookie_id}: mark recent interactive login, source={source}")
+
+    @classmethod
+    def get_recent_interactive_login(cls, cookie_id: str, max_age_seconds: int = 300):
+        if not cookie_id:
+            return None
+        record = cls._interactive_login_times.get(str(cookie_id))
+        if not record:
+            return None
+        if time.time() - record.get("time", 0) > max_age_seconds:
+            cls._interactive_login_times.pop(str(cookie_id), None)
+            return None
+        return record
 
     def _cleanup_instance_caches(self):
         """清理实例级别的缓存，防止内存泄漏"""
@@ -778,6 +865,7 @@ class XianyuLive:
         self.last_ws_message_time = 0
         self.ws_send_lock = asyncio.Lock()
         self.order_buyer_cache = {}
+        self.recent_chat_orders = {}
         self.pushed_order_statuses = set()
 
         # Token刷新相关配置
@@ -787,6 +875,9 @@ class XianyuLive:
         self.current_token = None
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
+        self.auth_blocked_until = 0
+        self.auth_block_reason = ""
+        self.auth_block_cooldown = 900
 
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
@@ -806,6 +897,7 @@ class XianyuLive:
         self.delivery_sent_orders = set()  # 记录已发货的订单ID，防止重复发货
 
         self.session = None  # 用于API调用的aiohttp session
+        self._session_cookie_snapshot = None
         self._order_detail_fetch_attempts = {}  # 每个订单详情只尝试一次
 
         # 启动定期清理过期暂停记录的任务
@@ -1550,6 +1642,33 @@ class XianyuLive:
         except Exception as e:
             logger.warning(f"[ORDER-EVENT][{stage}] log failed: {self._safe_str(e)}")
 
+    def _remember_chat_order(self, chat_id: str, order_id: str, user_id: str = None, item_id: str = None):
+        if not chat_id or not order_id:
+            return
+        self.recent_chat_orders[str(chat_id)] = {
+            "order_id": str(order_id),
+            "user_id": str(user_id or ""),
+            "item_id": str(item_id or ""),
+            "time": time.time(),
+        }
+
+    def _get_recent_chat_order(self, chat_id: str, max_age_seconds: int = 1800):
+        if not chat_id:
+            return None
+        recent = self.recent_chat_orders.get(str(chat_id))
+        if not recent:
+            return None
+        if time.time() - recent.get("time", 0) > max_age_seconds:
+            self.recent_chat_orders.pop(str(chat_id), None)
+            return None
+        return recent
+
+    def _resolve_red_reminder_chat_id(self, message: dict, user_id: str = None):
+        chat_id = self.extract_chat_id_from_message(message)
+        if chat_id == "1" and user_id and str(user_id).isdigit():
+            return str(user_id)
+        return chat_id
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
         """统一处理自动发货逻辑"""
@@ -1773,6 +1892,15 @@ class XianyuLive:
         notification_sent = False
         
         try:
+            if self._is_auth_blocked():
+                remaining = self._get_auth_block_remaining()
+                logger.warning(
+                    f"[AUTH_BLOCKED] {self.cookie_id}: skip token refresh, "
+                    f"remaining={remaining}s, reason={self.auth_block_reason}"
+                )
+                self.last_token_refresh_status = "auth_blocked"
+                return None
+
             logger.info(f"【{self.cookie_id}】开始刷新token... (滑块验证重试次数: {captcha_retry_count})")
             # 标记本次刷新状态
             self.last_token_refresh_status = "started"
@@ -1945,8 +2073,17 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】  响应内容: {json.dumps(res_json, ensure_ascii=False, indent=2)}")
                     logger.info(f"【{self.cookie_id}】================================")
 
-                    # 检查并更新Cookie
-                    if 'set-cookie' in response.headers:
+                    ret_value = res_json.get('ret', []) if isinstance(res_json, dict) else []
+                    token_refresh_success = (
+                        isinstance(res_json, dict)
+                        and any('SUCCESS::调用成功' in ret for ret in ret_value)
+                        and 'data' in res_json
+                        and 'accessToken' in res_json['data']
+                    )
+
+                    # 只有Token刷新成功时才更新Cookie。
+                    # 风控/滑块响应里的Set-Cookie通常只有临时x5secdata，不能写回数据库污染CK。
+                    if token_refresh_success and 'set-cookie' in response.headers:
                         new_cookies = {}
                         for cookie in response.headers.getall('set-cookie', []):
                             if '=' in cookie:
@@ -1963,34 +2100,60 @@ class XianyuLive:
                             logger.warning("已更新Cookie到数据库")
 
                     if isinstance(res_json, dict):
-                        ret_value = res_json.get('ret', [])
                         # 检查ret是否包含成功信息
-                        if any('SUCCESS::调用成功' in ret for ret in ret_value):
-                            if 'data' in res_json and 'accessToken' in res_json['data']:
-                                new_token = res_json['data']['accessToken']
-                                self.current_token = new_token
-                                self.last_token_refresh_time = time.time()
+                        if token_refresh_success:
+                            new_token = res_json['data']['accessToken']
+                            self.current_token = new_token
+                            self.last_token_refresh_time = time.time()
 
-                                # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
-                                self.last_message_received_time = 0
-                                logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
+                            # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
+                            self.last_message_received_time = 0
+                            logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
 
-                                logger.info(f"【{self.cookie_id}】Token刷新成功")
-                                # 标记为成功
-                                self.last_token_refresh_status = "success"
-                                
-                                # 处理待确认发货队列（Token刷新成功后自动重试之前失败的订单）
-                                asyncio.create_task(self.process_pending_confirm_orders())
-                                
-                                return new_token
+                            logger.info(f"【{self.cookie_id}】Token刷新成功")
+                            # 标记为成功
+                            self.last_token_refresh_status = "success"
+                            self._clear_auth_blocked()
+
+                            # 处理待确认发货队列（Token刷新成功后自动重试之前失败的订单）
+                            asyncio.create_task(self.process_pending_confirm_orders())
+
+                            return new_token
 
                     # 检查是否需要滑块验证
                     if self._need_captcha_verification(res_json):
+                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
+                        if captcha_retry_count < self.max_captcha_verification_count:
+                            manual_cookies = await self._handle_token_punish_verification(verification_url)
+                            if manual_cookies:
+                                logger.info(f"【{self.cookie_id}】Token风控验证处理完成，立即重试Token刷新")
+                                notification_sent = True
+                                return await self.refresh_token(captcha_retry_count + 1, force=True)
+
+                        qr_recent = (
+                            getattr(self, "last_qr_cookie_refresh_time", 0) > 0
+                            and time.time() - self.last_qr_cookie_refresh_time < 300
+                        )
+                        interactive_login = self.get_recent_interactive_login(self.cookie_id, 300)
+                        recent_manual_login = qr_recent or bool(interactive_login)
+                        auth_cooldown = 300 if recent_manual_login else 1800
+                        auth_reason = (
+                            f"token API risk validate after recent {interactive_login.get('source') if interactive_login else 'qr'} login; manual verification failed or timed out"
+                            if recent_manual_login else
+                            "token API risk validate; manual verification failed or timed out"
+                        )
+                        self._mark_auth_blocked(auth_reason, auth_cooldown)
+                        logger.warning(
+                            f"【{self.cookie_id}】Token接口触发风控，人工验证未完成，"
+                            f"进入冷却 {auth_cooldown} 秒，等待正常网页登录/扫码刷新CK"
+                        )
+                        log_captcha_event(self.cookie_id, "检测到Token风控", None, f"触发场景: Token刷新, 人工验证未完成，进入冷却，URL: {verification_url}")
+                        notification_sent = True
+                        return None
+
                         logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
 
                         # 记录滑块验证检测到日志文件
-                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
-                        log_captcha_event(self.cookie_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
 
                         # 添加风控日志记录
                         log_id = None
@@ -2190,6 +2353,133 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】检查是否需要滑块验证时出错: {self._safe_str(e)}")
             return False
+
+    async def _handle_token_punish_verification(self, verification_url: str) -> str:
+        """用可见浏览器打开token接口返回的punish验证页，等待人工完成后回收x5 Cookie。"""
+        if not verification_url or verification_url == 'Token刷新时检测':
+            return None
+
+        playwright = None
+        browser = None
+        try:
+            from playwright.async_api import async_playwright
+
+            logger.warning(f"【{self.cookie_id}】Token接口触发风控，准备打开可见浏览器进行人工验证")
+            logger.warning(f"【{self.cookie_id}】验证链接有效期较短，请在弹出的浏览器中尽快完成验证: {verification_url}")
+            log_captcha_event(self.cookie_id, "Token风控人工验证开始", None, f"URL: {verification_url}")
+
+            playwright = await async_playwright().start()
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=TranslateUI',
+                '--no-first-run',
+                '--no-default-browser-check',
+            ]
+            browser = await playwright.chromium.launch(
+                headless=False,
+                args=browser_args
+            )
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+                viewport={'width': 1280, 'height': 900}
+            )
+
+            cookies = []
+            for cookie_pair in self.cookies_str.split('; '):
+                if '=' in cookie_pair:
+                    name, value = cookie_pair.split('=', 1)
+                    cookies.append({
+                        'name': name.strip(),
+                        'value': value.strip(),
+                        'domain': '.goofish.com',
+                        'path': '/'
+                    })
+            if cookies:
+                await context.add_cookies(cookies)
+                logger.info(f"【{self.cookie_id}】已向人工验证浏览器写入 {len(cookies)} 个Cookie")
+
+            page = await context.new_page()
+            await page.goto(verification_url, wait_until='domcontentloaded', timeout=20000)
+            logger.warning(f"【{self.cookie_id}】人工验证窗口已打开，最多等待90秒")
+
+            start_time = time.time()
+            last_url = verification_url
+            verification_passed = False
+            while time.time() - start_time < 90:
+                await asyncio.sleep(2)
+                try:
+                    last_url = page.url
+                    title = await page.title()
+                    page_text = ""
+                    try:
+                        page_text = await page.locator("body").inner_text(timeout=1000)
+                    except Exception:
+                        page_text = ""
+                    logger.info(f"【{self.cookie_id}】等待人工验证中... title={title}, url={last_url[:160]}")
+                    if any(keyword in page_text for keyword in ("验证失败", "点击框体重试", "error:")):
+                        logger.warning(f"【{self.cookie_id}】人工验证页面提示失败，可在窗口内点击框体继续重试")
+                    if 'punish' not in last_url and 'captcha' not in last_url:
+                        verification_passed = True
+                        logger.info(f"【{self.cookie_id}】验证页URL已跳转，准备回收Cookie")
+                        break
+                except Exception as page_e:
+                    logger.info(f"【{self.cookie_id}】验证页面可能已关闭，准备回收Cookie: {self._safe_str(page_e)}")
+                    break
+
+            browser_cookies = await context.cookies()
+            browser_cookie_dict = {c['name']: c['value'] for c in browser_cookies}
+            x5_cookies = {
+                k: v for k, v in browser_cookie_dict.items()
+                if k.lower().startswith('x5') or 'x5sec' in k.lower()
+            }
+
+            if not x5_cookies:
+                logger.warning(f"【{self.cookie_id}】人工验证结束，但没有获取到x5相关Cookie")
+                log_captcha_event(self.cookie_id, "Token风控人工验证未获取Cookie", False, f"last_url: {last_url}")
+                return None
+            if not verification_passed or not x5_cookies.get("x5sec"):
+                logger.warning(
+                    f"【{self.cookie_id}】人工验证未确认通过或缺少x5sec，不写入Cookie: "
+                    f"passed={verification_passed}, x5_cookies={list(x5_cookies.keys())}"
+                )
+                log_captcha_event(
+                    self.cookie_id,
+                    "Token风控人工验证未确认通过",
+                    False,
+                    f"passed={verification_passed}, x5 cookies: {list(x5_cookies.keys())}, last_url: {last_url}"
+                )
+                self._mark_auth_blocked("token punish verification not confirmed", 300)
+                return None
+
+            updated_cookies = self.cookies.copy()
+            changed = []
+            for name, value in x5_cookies.items():
+                if updated_cookies.get(name) != value:
+                    changed.append(name)
+                updated_cookies[name] = value
+
+            self.cookies = updated_cookies
+            self.cookies_str = '; '.join([f"{k}={v}" for k, v in updated_cookies.items()])
+            await self.update_config_cookies()
+            logger.warning(f"【{self.cookie_id}】人工验证Cookie已更新: {', '.join(changed) if changed else 'x5值无变化'}")
+            log_captcha_event(self.cookie_id, "Token风控人工验证完成", True, f"x5 cookies: {list(x5_cookies.keys())}, last_url: {last_url}")
+            return self.cookies_str
+
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】Token风控人工验证处理失败: {self._safe_str(e)}")
+            log_captcha_event(self.cookie_id, "Token风控人工验证异常", False, self._safe_str(e))
+            return None
+        finally:
+            try:
+                if browser:
+                    await browser.close()
+                if playwright:
+                    await playwright.stop()
+            except Exception as close_e:
+                logger.warning(f"【{self.cookie_id}】关闭人工验证浏览器失败: {self._safe_str(close_e)}")
 
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
@@ -2481,6 +2771,9 @@ class XianyuLive:
                 # 更新数据库中的cookies
                 await self.update_config_cookies()
                 logger.info(f"【{self.cookie_id}】数据库cookies更新成功")
+
+                await self.close_session()
+                logger.info(f"【{self.cookie_id}】Cookie更新后已关闭旧aiohttp session，等待重启后重建")
 
                 # 通过CookieManager重启任务
                 logger.info(f"【{self.cookie_id}】通过CookieManager重启任务...")
@@ -3522,9 +3815,8 @@ class XianyuLive:
             logger.error("获取商品信息失败，重试次数过多")
             return {"error": "获取商品信息失败，重试次数过多"}
 
-        # 确保session已创建
-        if not self.session:
-            await self.create_session()
+        # 确保session已创建且Cookie是最新的
+        await self.create_session()
 
         params = {
             'jsv': '2.7.2',
@@ -4421,67 +4713,121 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】sold order list exception: {self._safe_str(e)}")
             return []
 
+    def _is_order_full_info_empty_or_invalid(self, response_json: dict) -> bool:
+        if not isinstance(response_json, dict):
+            return True
+        module = response_json.get("data", {}).get("module", {})
+        return not isinstance(module, dict) or not module
+
+    def _should_refresh_cookie_for_order_full_info(self, response_json: dict) -> bool:
+        if not isinstance(response_json, dict):
+            return False
+        response_text = json.dumps(response_json, ensure_ascii=False, separators=(",", ":"))
+        refresh_keywords = (
+            "FAIL_SYS_TOKEN_EXOIRED",
+            "FAIL_SYS_SESSION_EXPIRED",
+            "令牌过期",
+            "Session过期",
+            "TOKEN",
+            "ILLEGAL_ACCESS",
+        )
+        if any(keyword in response_text for keyword in refresh_keywords):
+            return True
+        return False
+
+    async def _request_order_full_info_once(self, order_id: str, stage: str):
+        token_value = trans_cookies(self.cookies_str).get("_m_h5_tk", "")
+        token = token_value.split("_", 1)[0] if token_value else ""
+        if not token:
+            logger.warning(f"【{self.cookie_id}】order full info skipped: _m_h5_tk missing, stage={stage}")
+            return None
+
+        timestamp = str(int(time.time() * 1000))
+        data_val = json.dumps(
+            {"tid": order_id},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        params = {
+            "jsv": "2.7.2",
+            "appKey": "34839810",
+            "t": timestamp,
+            "sign": generate_sign(timestamp, token, data_val),
+            "v": "1.0",
+            "type": "json",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": "mtop.taobao.idle.trade.merchant.full.info",
+            "valueType": "string",
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": "a21ybx.home.0.0",
+            "spm_pre": "a21107h.42829827.0.0",
+        }
+        headers = {
+            "accept": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "content-type": "application/x-www-form-urlencoded",
+            "cookie": self.cookies_str,
+            "idle_site_biz_code": "COMMONPRO",
+            "idle_user_group_member_id": "",
+            "origin": "https://seller.goofish.com",
+            "referer": "https://seller.goofish.com/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
+        }
+        self._log_order_full_info_cookie_diag(self.cookies_str, order_id, stage)
+        url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/"
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
+                response_text = await response.text()
+                if response.status != 200:
+                    logger.warning(
+                        f"【{self.cookie_id}】order full info failed: HTTP {response.status}, "
+                        f"order_id={order_id}, stage={stage}, response={response_text[:300]}"
+                    )
+                    return None
+                try:
+                    response_json = json.loads(response_text)
+                except Exception:
+                    logger.warning(f"【{self.cookie_id}】order full info invalid json: {response_text[:300]}")
+                    return None
+                return response_json
+
     async def fetch_order_full_info(self, order_id: str):
         """Fetch order detail from Goofish mtop full.info API; Playwright detail fetch is disabled."""
         try:
-            token_value = trans_cookies(self.cookies_str).get("_m_h5_tk", "")
-            token = token_value.split("_", 1)[0] if token_value else ""
-            if not token:
-                logger.warning(f"【{self.cookie_id}】order full info skipped: _m_h5_tk missing")
-                return None
-
             order_id = str(order_id or "").strip()
             if not order_id:
                 return None
 
-            timestamp = str(int(time.time() * 1000))
-            data_val = json.dumps(
-                {"tid": order_id},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            params = {
-                "jsv": "2.7.2",
-                "appKey": "34839810",
-                "t": timestamp,
-                "sign": generate_sign(timestamp, token, data_val),
-                "v": "1.0",
-                "type": "json",
-                "accountSite": "xianyu",
-                "dataType": "json",
-                "timeout": "20000",
-                "api": "mtop.taobao.idle.trade.merchant.full.info",
-                "valueType": "string",
-                "sessionOption": "AutoLoginOnly",
-                "spm_cnt": "a21ybx.home.0.0",
-                "spm_pre": "a21107h.42829799.0.0",
-            }
-            headers = {
-                "accept": "application/json",
-                "accept-language": "zh-CN,zh;q=0.9",
-                "content-type": "application/x-www-form-urlencoded",
-                "cookie": self.cookies_str,
-                "idle_site_biz_code": "COMMONPRO",
-                "origin": "https://seller.goofish.com",
-                "referer": "https://seller.goofish.com/",
-                "user-agent": DEFAULT_HEADERS.get("user-agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            }
-            url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/"
-            timeout = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
-                    response_text = await response.text()
-                    if response.status != 200:
-                        logger.warning(
-                            f"【{self.cookie_id}】order full info failed: HTTP {response.status}, "
-                            f"order_id={order_id}, response={response_text[:300]}"
-                        )
-                        return None
-                    try:
-                        response_json = json.loads(response_text)
-                    except Exception:
-                        logger.warning(f"【{self.cookie_id}】order full info invalid json: {response_text[:300]}")
-                        return None
+            self._reload_latest_cookie_from_db("order full info before request")
+            response_json = await self._request_order_full_info_once(order_id, "initial")
+            if response_json is None:
+                return None
+
+            if self._is_order_full_info_empty_or_invalid(response_json):
+                ret_value = response_json.get("ret", []) if isinstance(response_json, dict) else []
+                data_value = response_json.get("data", {}) if isinstance(response_json, dict) else {}
+                data_keys = list(data_value.keys()) if isinstance(data_value, dict) else []
+                logger.warning(
+                    f"【{self.cookie_id}】order full info empty module: order_id={order_id}, "
+                    f"ret={ret_value}, data_keys={data_keys}"
+                )
+                self._reload_latest_cookie_from_db("order full info retry after empty module")
+                response_json = await self._request_order_full_info_once(order_id, "retry_after_cookie_reload")
+                if response_json is None:
+                    return None
+
+            if self._is_order_full_info_empty_or_invalid(response_json):
+                ret_value = response_json.get("ret", []) if isinstance(response_json, dict) else []
+                data_value = response_json.get("data", {}) if isinstance(response_json, dict) else {}
+                data_keys = list(data_value.keys()) if isinstance(data_value, dict) else []
+                logger.warning(
+                    f"【{self.cookie_id}】order full info still empty after retry: "
+                    f"order_id={order_id}, ret={ret_value}, data_keys={data_keys}"
+                )
+                return None
 
             module = response_json.get("data", {}).get("module", {}) if isinstance(response_json, dict) else {}
             buyer_vo = module.get("merchantBuyerVO") or {}
@@ -4603,7 +4949,9 @@ class XianyuLive:
             from db_manager import db_manager
             import aiohttp
 
-            push_enabled = (GOOFISH_CHAT_API or {}).get("enabled", True)
+            push_enabled = db_manager.get_system_setting("goofish_chat_api_enabled")
+            if push_enabled is None:
+                push_enabled = (GOOFISH_CHAT_API or {}).get("enabled", True)
             if isinstance(push_enabled, str):
                 push_enabled = push_enabled.strip().lower() not in {"false", "0", "no", "off"}
             if not push_enabled:
@@ -4621,8 +4969,9 @@ class XianyuLive:
                 return False
 
             api_url = (
-                (GOOFISH_CHAT_API or {}).get("url")
+                db_manager.get_system_setting("goofish_chat_api_url")
                 or db_manager.get_system_setting("goofish.chat.api.url")
+                or (GOOFISH_CHAT_API or {}).get("url")
                 or os.getenv("GOOFISH_CHAT_API_URL")
                 or ""
             ).strip()
@@ -6006,9 +6355,8 @@ class XianyuLive:
             if method == 'POST' and params:
                 logger.warning(f"POST请求参数: {json.dumps(params, ensure_ascii=False)}")
 
-            # 确保session存在
-            if not self.session:
-                await self.create_session()
+            # 确保session存在且Cookie是最新的
+            await self.create_session()
 
             # 发起HTTP请求
             timeout_obj = aiohttp.ClientTimeout(total=timeout)
@@ -8067,29 +8415,48 @@ class XianyuLive:
         except Exception:
             return False
 
-    async def create_session(self):
-        """创建aiohttp session"""
-        if not self.session:
-            # 创建带有cookies和headers的session
-            headers = DEFAULT_HEADERS.copy()
-            headers['cookie'] = self.cookies_str
+    def _normalized_cookie_header(self):
+        return (self.cookies_str or "").replace("\n", "").replace("\r", "").strip()
 
-            self.session = aiohttp.ClientSession(
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
-            )
+    async def create_session(self, force: bool = False):
+        """创建aiohttp session"""
+        cookie_changed = self._reload_latest_cookie_from_db("create_session")
+        cookie_header = self._normalized_cookie_header()
+        if (
+            self.session
+            and not self.session.closed
+            and not force
+            and not cookie_changed
+            and self._session_cookie_snapshot == cookie_header
+        ):
+            return
+
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+            logger.info(f"【{self.cookie_id}】aiohttp session recreated because cookie changed or force={force}")
+
+        # 创建带有cookies和headers的session
+        headers = DEFAULT_HEADERS.copy()
+        headers['cookie'] = cookie_header
+
+        self.session = aiohttp.ClientSession(
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+        self._session_cookie_snapshot = cookie_header
 
     async def close_session(self):
         """关闭aiohttp session"""
         if self.session:
             await self.session.close()
             self.session = None
+        self._session_cookie_snapshot = None
 
     async def get_api_reply(self, msg_time, user_url, send_user_id, send_user_name, item_id, send_message, chat_id, image_urls):
         """调用API获取回复消息"""
         try:
-            if not self.session:
-                await self.create_session()
+            await self.create_session()
 
             api_config = AUTO_REPLY.get('api', {})
             timeout = aiohttp.ClientTimeout(total=api_config.get('timeout', 30))
@@ -8862,6 +9229,7 @@ class XianyuLive:
 
                         # 提取chat_id（会话ID，从reminderUrl的sid参数提取）
                         temp_chat_id = self.extract_chat_id_from_message(message)
+                        self._remember_chat_order(temp_chat_id, order_id, temp_user_id, temp_item_id)
 
                         # 推送订单状态到Java后台
                         try:
@@ -8988,7 +9356,12 @@ class XianyuLive:
                 if red_reminder == '等待买家付款':
                     if not order_push_sent:
                         red_order_id = order_id or self._extract_order_id(message)
-                        red_chat_id = self.extract_chat_id_from_message(message)
+                        red_chat_id = self._resolve_red_reminder_chat_id(message, user_id)
+                        recent_order = self._get_recent_chat_order(red_chat_id)
+                        if not red_order_id and recent_order:
+                            red_order_id = recent_order.get("order_id")
+                            item_id = item_id or recent_order.get("item_id")
+                            user_id = user_id or recent_order.get("user_id")
                         self._log_order_event_diag(
                             "red-reminder", message, order_id=red_order_id or "",
                             order_status="pending_payment", chat_id=red_chat_id,
@@ -9022,7 +9395,12 @@ class XianyuLive:
                 elif red_reminder == '等待卖家发货':
                     if not order_push_sent:
                         red_order_id = order_id or self._extract_order_id(message)
-                        red_chat_id = self.extract_chat_id_from_message(message)
+                        red_chat_id = self._resolve_red_reminder_chat_id(message, user_id)
+                        recent_order = self._get_recent_chat_order(red_chat_id)
+                        if not red_order_id and recent_order:
+                            red_order_id = recent_order.get("order_id")
+                            item_id = item_id or recent_order.get("item_id")
+                            user_id = user_id or recent_order.get("user_id")
                         self._log_order_event_diag(
                             "red-reminder", message, order_id=red_order_id or "",
                             order_status="paid", chat_id=red_chat_id,
@@ -9424,8 +9802,9 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止主循环")
                         break
 
+                    self._reload_latest_cookie_from_db("before websocket connect")
                     headers = WEBSOCKET_HEADERS.copy()
-                    headers['Cookie'] = self.cookies_str
+                    headers['Cookie'] = self._normalized_cookie_header()
 
                     # 更新连接状态为连接中
                     self._set_connection_state(ConnectionState.CONNECTING, "准备建立WebSocket连接")
@@ -9571,12 +9950,22 @@ class XianyuLive:
                         # 更新连接状态为重连中
                         self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重连")
 
-                    if await self._try_password_login_on_disconnect(error_msg, error_type):
+                    if self._is_auth_blocked():
+                        logger.warning(
+                            f"[AUTH_BLOCKED] {self.cookie_id}: skip password login on disconnect, "
+                            f"remaining={self._get_auth_block_remaining()}s, reason={self.auth_block_reason}"
+                        )
+                    elif await self._try_password_login_on_disconnect(error_msg, error_type):
                         logger.info(f"【{self.cookie_id}】密码登录恢复完成，跳过普通重连等待，立即开始新一轮连接")
                         continue
 
                     # 检查是否超过最大失败次数
-                    if self.connection_failures >= self.max_connection_failures:
+                    if self._is_auth_blocked():
+                        logger.warning(
+                            f"[AUTH_BLOCKED] {self.cookie_id}: keep cooling down, "
+                            f"skip max-failure password login/restart path"
+                        )
+                    elif self.connection_failures >= self.max_connection_failures:
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
                         
@@ -9636,8 +10025,8 @@ class XianyuLive:
                         except:
                             pass
                         
-                        # 使用可中断的sleep，每5秒输出一次心跳日志
-                        chunk_size = 5.0  # 每5秒输出一次日志
+                        # 使用可中断的sleep，风控冷却期间减少等待日志刷屏
+                        chunk_size = 30.0 if self._is_auth_blocked() else 5.0
                         remaining = retry_delay
                         start_time = time.time()
                         
@@ -9781,9 +10170,8 @@ class XianyuLive:
             logger.error("获取商品信息失败，重试次数过多")
             return {"error": "获取商品信息失败，重试次数过多"}
 
-        # 确保session已创建
-        if not self.session:
-            await self.create_session()
+        # 确保session已创建且Cookie是最新的
+        await self.create_session()
 
         params = {
             'jsv': '2.7.2',

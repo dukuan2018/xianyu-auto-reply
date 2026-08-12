@@ -132,8 +132,19 @@ class GeetestLib:
                 data = response.json()
                 logger.debug(f"极验register响应: {data}")
                 return data.get("challenge", "")
+        except httpx.HTTPStatusError as e:
+            response = e.response
+            logger.error(
+                f"极验register请求失败: type={type(e).__name__}, "
+                f"status={response.status_code}, url={url}, params={params}, "
+                f"response={response.text[:500]}"
+            )
+            return ""
         except Exception as e:
-            logger.error(f"极验register请求失败: {e}")
+            logger.error(
+                f"极验register请求失败: type={type(e).__name__}, "
+                f"message={repr(e)}, url={url}, params={params}"
+            )
             return ""
     
     def _build_register_result(
@@ -257,8 +268,16 @@ class GeetestLib:
                 data = response.json()
                 logger.debug(f"极验validate响应: {data}")
                 return data.get("seccode", "")
+        except httpx.HTTPStatusError as e:
+            response = e.response
+            logger.error(
+                f"极验validate请求失败: type={type(e).__name__}, "
+                f"status={response.status_code}, url={url}, "
+                f"response={response.text[:500]}"
+            )
+            return ""
         except Exception as e:
-            logger.error(f"极验validate请求失败: {e}")
+            logger.error(f"极验validate请求失败: type={type(e).__name__}, message={repr(e)}, url={url}")
             return ""
     
     def _check_params(self, challenge: str, validate: str, seccode: str) -> bool:

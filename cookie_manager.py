@@ -353,14 +353,16 @@ class CookieManager:
             logger.warning(f"Cookie任务已存在，跳过启动: {cookie_id}")
             return
 
-        cookie_value = self.cookies.get(cookie_id)
-        if not cookie_value:
-            logger.error(f"Cookie值不存在，无法启动任务: {cookie_id}")
-            return
-
         try:
-            # 获取Cookie对应的user_id
+            # 启动前强制读取数据库最新Cookie，避免使用CookieManager初始化时缓存的旧CK。
             cookie_info = db_manager.get_cookie_details(cookie_id)
+            cookie_value = cookie_info.get('value') if cookie_info else None
+            if not cookie_value:
+                cookie_value = self.cookies.get(cookie_id)
+            if not cookie_value:
+                logger.error(f"Cookie值不存在，无法启动任务: {cookie_id}")
+                return
+            self.cookies[cookie_id] = cookie_value
             user_id = cookie_info.get('user_id') if cookie_info else None
 
             # 使用异步方式启动任务
@@ -487,19 +489,28 @@ class CookieManager:
                         logger.error(f"等待任务清理时出错: {cookie_id}, {e}")
                     logger.info(f"【{cookie_id}】旧任务已停止")
 
-                # 更新Cookie值
-                self.cookies[cookie_id] = new_cookie_value
-                
                 # 只有在需要时才保存到数据库
                 if save_to_db:
                     db_manager.save_cookie(cookie_id, new_cookie_value, original_user_id)
+                    start_cookie_value = new_cookie_value
+                else:
+                    # 不保存数据库的重启，优先使用数据库最新CK启动。
+                    latest_cookie_info = db_manager.get_cookie_details(cookie_id)
+                    start_cookie_value = (
+                        latest_cookie_info.get('value')
+                        if latest_cookie_info and latest_cookie_info.get('value')
+                        else new_cookie_value
+                    )
+
+                # 更新Cookie值
+                self.cookies[cookie_id] = start_cookie_value
 
                 # 恢复关键词和状态
                 self.keywords[cookie_id] = original_keywords
                 self.cookie_status[cookie_id] = original_status
 
                 # 重新启动任务
-                new_task = self._create_cookie_task(cookie_id, new_cookie_value, original_user_id)
+                new_task = self._create_cookie_task(cookie_id, start_cookie_value, original_user_id)
 
                 # 短暂等待并验证任务是否正常启动
                 await asyncio.sleep(0.1)
