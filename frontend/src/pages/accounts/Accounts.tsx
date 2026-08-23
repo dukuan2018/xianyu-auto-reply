@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Eye, EyeOff, AlertTriangle } from 'lucide-react'
-import { getAccountDetails, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, getAllAIReplySettings, getAIReplySettings, updateAIReplySettings, toggleAIReply, updateAccountLoginInfo, type AIReplySettings } from '@/api/accounts'
+import { getAccountDetails, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, updateAccountAutoConfirm, updateAccountPauseDuration, getAllAIReplySettings, getAIReplySettings, updateAIReplySettings, toggleAIReply, updateAccountLoginInfo, refreshAccountToken, type AIReplySettings } from '@/api/accounts'
 import { getKeywords, getDefaultReply, updateDefaultReply } from '@/api/keywords'
 import { checkDefaultPassword } from '@/api/settings'
 import { useUIStore } from '@/store/uiStore'
@@ -61,6 +61,7 @@ export function Accounts() {
   const [editLoginPassword, setEditLoginPassword] = useState('')
   const [editShowBrowser, setEditShowBrowser] = useState(false)
   const [showLoginPassword, setShowLoginPassword] = useState(false)
+  const [refreshingTokenId, setRefreshingTokenId] = useState('')
 
   // AI设置状态
   const [aiSettingsAccount, setAiSettingsAccount] = useState<AccountWithKeywordCount | null>(null)
@@ -345,6 +346,24 @@ export function Accounts() {
       loadAccounts()
     } catch {
       addToast({ type: 'error', message: '删除失败' })
+    }
+  }
+
+  const handleRefreshToken = async (account: AccountWithKeywordCount) => {
+    if (refreshingTokenId) return
+    try {
+      setRefreshingTokenId(account.id)
+      const result = await refreshAccountToken(account.id)
+      if (result.success) {
+        addToast({ type: 'success', message: result.message || 'Token刷新成功' })
+        await loadAccounts()
+      } else {
+        addToast({ type: 'error', message: result.message || 'Token刷新失败' })
+      }
+    } catch {
+      addToast({ type: 'error', message: 'Token刷新失败' })
+    } finally {
+      setRefreshingTokenId('')
     }
   }
 
@@ -663,6 +682,19 @@ export function Accounts() {
                         >
                           <Bot className="w-3.5 h-3.5 text-purple-500" />
                           <span className="text-purple-600 dark:text-purple-400">AI设置</span>
+                        </button>
+                        <button
+                          onClick={() => handleRefreshToken(account)}
+                          disabled={!!refreshingTokenId}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="刷新Token"
+                        >
+                          {refreshingTokenId === account.id ? (
+                            <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />
+                          ) : (
+                            <RefreshCw className="w-3.5 h-3.5 text-blue-500" />
+                          )}
+                          <span className="text-blue-600 dark:text-blue-400">刷新Token</span>
                         </button>
                         <button
                           onClick={() => openDefaultReplyModal(account)}

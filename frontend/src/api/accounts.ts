@@ -85,6 +85,11 @@ export const updateAccountLoginInfo = (id: string, data: {
   return put(`/cookies/${id}/login-info`, data)
 }
 
+// 手动刷新账号 Token
+export const refreshAccountToken = (id: string): Promise<ApiResponse & { token_length?: number; last_status?: string }> => {
+  return post(`/cookies/${id}/refresh-token`)
+}
+
 // 删除账号
 export const deleteAccount = (id: string): Promise<ApiResponse> => {
   return del(`/cookies/${id}`)

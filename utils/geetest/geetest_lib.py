@@ -277,7 +277,10 @@ class GeetestLib:
             )
             return ""
         except Exception as e:
-            logger.error(f"极验validate请求失败: type={type(e).__name__}, message={repr(e)}, url={url}")
+            logger.error(
+                f"极验validate请求失败: type={type(e).__name__}, message={repr(e)}, "
+                f"url={url}, params={params}"
+            )
             return ""
     
     def _check_params(self, challenge: str, validate: str, seccode: str) -> bool:

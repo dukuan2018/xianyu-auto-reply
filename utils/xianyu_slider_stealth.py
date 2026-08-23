@@ -2046,8 +2046,6 @@ class XianyuSliderStealth:
 
             pages = self._get_context_pages(page)
             frames = self._get_pages_and_frames(page)
-            current_url = (getattr(page, 'url', '') or '').lower()
-
             for idx, item_page in enumerate(pages):
                 logger.debug(
                     f"【{self.pure_user_id}】登录状态检查页面 {idx}: "
@@ -2078,13 +2076,19 @@ class XianyuSliderStealth:
                 except Exception:
                     continue
 
-            if 'goofish.com' in current_url and '/im' in current_url:
+            # 人工滑块/验证成功后，闲鱼可能新开 seller.goofish.com 的 IM 页签。
+            # 这里检查全部页签，只要进入 IM 页面且已有认证 Cookie，就认为登录成功，
+            # 外层 finally 会关闭 context，从而自动关闭浏览器窗口。
+            for item_page in pages:
+                current_url = (getattr(item_page, 'url', '') or '').lower()
+                if not self._is_goofish_im_url(current_url):
+                    continue
                 try:
-                    cookies = self.context.cookies() if self.context else page.context.cookies()
+                    cookies = self.context.cookies() if self.context else item_page.context.cookies()
                     cookie_names = {cookie.get('name') for cookie in cookies}
                     if 'unb' in cookie_names or 'sgcookie' in cookie_names:
                         logger.success(
-                            f"【{self.pure_user_id}】✅ 当前已在IM页面，检测到认证Cookie"
+                            f"【{self.pure_user_id}】✅ 当前已在IM页面，检测到认证Cookie: {current_url}"
                         )
                         return True
                 except Exception as cookie_error:
@@ -2130,6 +2134,15 @@ class XianyuSliderStealth:
             import traceback
             logger.debug(f"【{self.pure_user_id}】错误堆栈: {traceback.format_exc()}")
             return False
+
+    def _is_goofish_im_url(self, url: str) -> bool:
+        """判断是否已进入闲鱼 IM 页面，兼容 seller.goofish.com 新页签。"""
+        if not url:
+            return False
+        return (
+            ('seller.goofish.com' in url and '#/im' in url)
+            or ('goofish.com' in url and '/im' in url)
+        )
     
     def _check_login_error(self, page) -> tuple:
         """检测登录是否出现错误（如账密错误）

@@ -26,6 +26,7 @@ from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies, generate_sign
+from utils.mtop_client import mtop_call
 from utils.image_utils import image_manager
 
 from loguru import logger
@@ -1268,143 +1269,80 @@ async def fetch_sold_order_list_by_cookie(
     query_code: str = "NOT_PAY",
     page_number: int = 1,
     page_size: int = 20,
+    cookie_id: str = "",
 ):
-    cookie_dict = trans_cookies(cookie_value)
-    token_value = cookie_dict.get("_m_h5_tk", "")
-    token = token_value.split("_", 1)[0] if token_value else ""
-    if not token:
-        raise ValueError("_m_h5_tk token not found in cookie")
-
     page_number = max(int(page_number or 1), 1)
     page_size = min(max(int(page_size or 20), 1), 100)
     query_code = (query_code or "NOT_PAY").strip() or "NOT_PAY"
-    timestamp = str(int(time.time() * 1000))
-    data_val = json.dumps(
-        {
+    result = await mtop_call(
+        cookie_id=cookie_id,
+        cookie_value=cookie_value,
+        api="mtop.taobao.idle.trade.merchant.sold.get",
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/",
+        data_obj={
             "pageNumber": page_number,
             "rowsPerPage": page_size,
             "orderIds": "",
             "queryCode": query_code,
             "orderSearchParam": "{}",
         },
-        ensure_ascii=False,
-        separators=(",", ":"),
+        extra_params={
+            "valueType": "string",
+            "spm_cnt": "a21107h.42826273.0.0",
+        },
+        extra_headers={"referer": "https://seller.goofish.com/?site=COMMONPRO"},
+        log_stage="open_api_sold_order_list",
     )
-    params = {
-        "jsv": "2.7.2",
-        "appKey": "34839810",
-        "t": timestamp,
-        "sign": generate_sign(timestamp, token, data_val),
-        "v": "1.0",
-        "type": "json",
-        "accountSite": "xianyu",
-        "dataType": "json",
-        "timeout": "20000",
-        "api": "mtop.taobao.idle.trade.merchant.sold.get",
-        "valueType": "string",
-        "sessionOption": "AutoLoginOnly",
-        "spm_cnt": "a21107h.42826273.0.0",
-    }
-    headers = {
-        "accept": "application/json",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "content-type": "application/x-www-form-urlencoded",
-        "cookie": cookie_value,
-        "idle_site_biz_code": "COMMONPRO",
-        "origin": "https://seller.goofish.com",
-        "referer": "https://seller.goofish.com/?site=COMMONPRO",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
-    }
-    url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/"
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
-            response_text = await response.text()
-            try:
-                response_body = json.loads(response_text)
-            except Exception:
-                response_body = response_text
-            return response.status, response_body
+    return result.get("http_status", 0), result.get("body")
 
 
 async def fetch_order_full_info_by_cookie(cookie_value: str, order_id: str, cookie_id: str = "", stage: str = "direct"):
-    cookie_dict = trans_cookies(cookie_value)
-    token_value = cookie_dict.get("_m_h5_tk", "")
-    token = token_value.split("_", 1)[0] if token_value else ""
-    if not token:
-        raise ValueError("_m_h5_tk token not found in cookie")
-
     order_id = str(order_id or "").strip()
     if not order_id:
         raise ValueError("order_id is required")
-
-    timestamp = str(int(time.time() * 1000))
-    data_val = json.dumps(
-        {"tid": order_id},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    params = {
-        "jsv": "2.7.2",
-        "appKey": "34839810",
-        "t": timestamp,
-        "sign": generate_sign(timestamp, token, data_val),
-        "v": "1.0",
-        "type": "json",
-        "accountSite": "xianyu",
-        "dataType": "json",
-        "timeout": "20000",
-        "api": "mtop.taobao.idle.trade.merchant.full.info",
-        "valueType": "string",
-        "sessionOption": "AutoLoginOnly",
-        "spm_cnt": "a21ybx.home.0.0",
-        "spm_pre": "a21107h.42829827.0.0",
-    }
-    headers = {
-        "accept": "application/json",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "content-type": "application/x-www-form-urlencoded",
-        "cookie": cookie_value,
-        "idle_site_biz_code": "COMMONPRO",
-        "idle_user_group_member_id": "",
-        "origin": "https://seller.goofish.com",
-        "referer": "https://seller.goofish.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
-    }
     if cookie_id:
         log_open_api_cookie_diag(cookie_id, cookie_value, order_id, stage)
-    url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/"
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
-            response_text = await response.text()
-            try:
-                response_body = json.loads(response_text)
-            except Exception:
-                response_body = response_text
-            return response.status, response_body
+    result = await mtop_call(
+        cookie_id=cookie_id,
+        cookie_value=cookie_value,
+        api="mtop.taobao.idle.trade.merchant.full.info",
+        url="https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.full.info/1.0/",
+        data_obj={"tid": order_id},
+        extra_params={
+            "valueType": "string",
+            "spm_cnt": "a21ybx.home.0.0",
+            "spm_pre": "a21107h.42829827.0.0",
+        },
+        extra_headers={"idle_user_group_member_id": "", "referer": "https://seller.goofish.com/"},
+        log_stage=stage,
+    )
+    return result.get("http_status", 0), result.get("body")
 
 
 def is_order_full_info_empty(response_body: dict) -> bool:
     if not isinstance(response_body, dict):
         return True
-    module = response_body.get("data", {}).get("module", {})
+    data = response_body.get("data")
+    data = data if isinstance(data, dict) else {}
+    module = data.get("module")
     return not isinstance(module, dict) or not module
 
 
+def safe_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def build_order_full_info_summary(response_body: dict) -> dict:
-    module = (
-        response_body.get("data", {})
-        .get("module", {})
-        if isinstance(response_body, dict) else {}
-    )
-    buyer_vo = module.get("merchantBuyerVO") or {}
-    common_data = module.get("merchantCommonData") or {}
-    merchant_price_vo = module.get("merchantPriceVO") or {}
-    order_info_vo = module.get("orderInfoVO") or {}
-    price_info = order_info_vo.get("priceInfo") or {}
-    price_amount = price_info.get("amount") or {}
-    bill_list = price_info.get("billList") or []
+    data = safe_dict(response_body).get("data")
+    module = safe_dict(safe_dict(data).get("module"))
+    buyer_vo = safe_dict(module.get("merchantBuyerVO"))
+    common_data = safe_dict(module.get("merchantCommonData"))
+    merchant_price_vo = safe_dict(module.get("merchantPriceVO"))
+    order_info_vo = safe_dict(module.get("orderInfoVO"))
+    price_info = safe_dict(order_info_vo.get("priceInfo"))
+    price_amount = safe_dict(price_info.get("amount"))
+    bill_list = price_info.get("billList")
+    bill_list = bill_list if isinstance(bill_list, list) else []
     buyer_id = str(buyer_vo.get("buyerId") or "").split("@", 1)[0].strip()
     order_id = str(common_data.get("orderId") or "").strip()
     order_amount = next(
@@ -1722,6 +1660,7 @@ async def not_pay_orders_api(request: NotPayOrdersRequest):
             query_code=cleaned_query_code,
             page_number=page_number,
             page_size=page_size,
+            cookie_id=cleaned_cookie_id,
         )
         items = []
         if isinstance(response_body, dict):
@@ -1789,6 +1728,7 @@ async def order_full_info_api(request: OrderFullInfoRequest):
         if live_instance:
             used_live_instance = True
             summary = await live_instance.fetch_order_full_info(cleaned_order_id)
+            summary = summary if isinstance(summary, dict) else {}
             if summary:
                 summary.setdefault("buyerId", summary.get("buyer_id", ""))
                 summary.setdefault("itemId", summary.get("item_id", ""))
@@ -1910,60 +1850,23 @@ async def modify_price_api(request: ModifyPriceRequest):
         if not cookie_value:
             return {"success": False, "message": "cookie not found"}
 
-        cookie_dict = trans_cookies(cookie_value)
-        token_value = cookie_dict.get("_m_h5_tk", "")
-        token = token_value.split("_", 1)[0] if token_value else ""
-        if not token:
-            return {"success": False, "message": "_m_h5_tk token not found in cookie"}
-
-        timestamp = str(int(time.time() * 1000))
-        data_val = json.dumps(
-            {
+        result = await mtop_call(
+            cookie_id=cleaned_cookie_id,
+            cookie_value=cookie_value,
+            api="mtop.taobao.idle.trade.merchant.user.adjust.price",
+            url="https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.user.adjust.price/1.0/",
+            data_obj={
                 "orderId": cleaned_order_id,
                 "modifyFee": cleaned_modify_fee,
                 "newTransportFee": cleaned_transport_fee,
             },
-            ensure_ascii=False,
-            separators=(",", ":"),
+            response_type="originaljson",
+            extra_params={"spm_cnt": "a21107h.42829799.0.0"},
+            extra_headers={"referer": "https://seller.goofish.com/?site=COMMONPRO"},
+            log_stage="modify_price",
         )
-        sign = generate_sign(timestamp, token, data_val)
-
-        params = {
-            "jsv": "2.7.2",
-            "appKey": "34839810",
-            "t": timestamp,
-            "sign": sign,
-            "v": "1.0",
-            "type": "originaljson",
-            "accountSite": "xianyu",
-            "dataType": "json",
-            "timeout": "20000",
-            "api": "mtop.taobao.idle.trade.merchant.user.adjust.price",
-            "sessionOption": "AutoLoginOnly",
-            "spm_cnt": "a21107h.42829799.0.0",
-        }
-        url = "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.user.adjust.price/1.0/"
-        headers = {
-            "accept": "application/json",
-            "accept-language": "zh-CN,zh;q=0.9",
-            "content-type": "application/x-www-form-urlencoded",
-            "cookie": cookie_value,
-            "idle_site_biz_code": "COMMONPRO",
-            "origin": "https://seller.goofish.com",
-            "referer": "https://seller.goofish.com/?site=COMMONPRO",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 VER-AN00",
-        }
-
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, params=params, data={"data": data_val}, headers=headers) as response:
-                response_text = await response.text()
-                http_status = response.status
-                try:
-                    response_body = json.loads(response_text)
-                except Exception:
-                    response_body = response_text
-
+        http_status = result.get("http_status", 0)
+        response_body = result.get("body")
         logger.info(
             f"modify-price result: cookie_id={cleaned_cookie_id}, order_id={cleaned_order_id}, "
             f"modify_fee={cleaned_modify_fee}, http_status={http_status}"
@@ -2570,70 +2473,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             log_with_user('warning', f"启动新账号任务失败: {account_id}, 错误: {str(task_err)}", current_user)
                             import traceback
                             logger.error(traceback.format_exc())
-                
-                # 登录成功后，调用_refresh_cookies_via_browser刷新Cookie
-                try:
-                    log_with_user('info', f"开始调用_refresh_cookies_via_browser刷新Cookie: {account_id}", current_user)
-                    from XianyuAutoAsync import XianyuLive
-                    
-                    # 创建临时的XianyuLive实例来刷新Cookie
-                    temp_xianyu = XianyuLive(
-                        cookies_str=cookies_str,
-                        cookie_id=account_id,
-                        user_id=user_id
-                    )
-                    
-                    # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
-                    try:
-                        temp_xianyu.reset_qr_cookie_refresh_flag()
-                        log_with_user('info', f"已重置扫码登录Cookie刷新标志: {account_id}", current_user)
-                    except Exception as reset_err:
-                        log_with_user('debug', f"重置扫码登录Cookie刷新标志失败（不影响刷新）: {str(reset_err)}", current_user)
-                    
-                    # 在后台异步执行刷新（不阻塞主流程）
-                    async def refresh_cookies_task():
-                        try:
-                            refresh_success = await temp_xianyu._refresh_cookies_via_browser(triggered_by_refresh_token=False)
-                            if refresh_success:
-                                log_with_user('info', f"Cookie刷新成功: {account_id}", current_user)
-                                # 刷新成功后，从数据库获取更新后的Cookie
-                                updated_cookie_info = db_manager.get_cookie_details(account_id)
-                                if updated_cookie_info:
-                                    refreshed_cookies = updated_cookie_info.get('value', '')
-                                    if refreshed_cookies:
-                                        # 更新cookie_manager中的Cookie
-                                        if cookie_manager.manager:
-                                            cookie_manager.manager.update_cookie(account_id, refreshed_cookies, save_to_db=False)
-                                        log_with_user('info', f"已更新刷新后的Cookie到cookie_manager: {account_id}", current_user)
-                            else:
-                                log_with_user('warning', f"Cookie刷新失败或跳过: {account_id}", current_user)
-                        except Exception as refresh_e:
-                            log_with_user('error', f"刷新Cookie时出错: {account_id}, 错误: {str(refresh_e)}", current_user)
-                            import traceback
-                            logger.error(traceback.format_exc())
-                    
-                    # 在后台线程中运行异步任务
-                    # 由于run_login是在线程中运行的，需要创建新的事件循环
-                    def run_async_refresh():
-                        try:
-                            import asyncio
-                            # 创建新的事件循环
-                            new_loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(new_loop)
-                            try:
-                                new_loop.run_until_complete(refresh_cookies_task())
-                            finally:
-                                new_loop.close()
-                        except Exception as e:
-                            log_with_user('error', f"运行异步刷新任务失败: {account_id}, 错误: {str(e)}", current_user)
-                    
-                    # 在后台线程中执行刷新任务
-                    refresh_thread = threading.Thread(target=run_async_refresh, daemon=True)
-                    refresh_thread.start()
-                    
-                except Exception as refresh_err:
-                    log_with_user('warning', f"调用_refresh_cookies_via_browser失败: {account_id}, 错误: {str(refresh_err)}", current_user)
-                    # 刷新失败不影响登录成功
                 
                 # 更新会话状态
                 password_login_sessions[session_id]['status'] = 'success'
@@ -3264,9 +3103,10 @@ async def reset_qr_cookie_refresh_cooldown(
         if not cookie_info:
             return {'success': False, 'message': '账号不存在'}
 
-        # 如果cookie_manager中有对应的实例，直接重置
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
+        # 如果有运行中的 XianyuLive 实例，直接重置
+        from XianyuAutoAsync import XianyuLive
+        instance = XianyuLive.get_instance(cookie_id)
+        if instance:
             remaining_time_before = instance.get_qr_cookie_refresh_remaining_time()
             instance.reset_qr_cookie_refresh_flag()
 
@@ -3304,9 +3144,10 @@ async def get_qr_cookie_refresh_cooldown_status(
         if not cookie_info:
             return {'success': False, 'message': '账号不存在'}
 
-        # 如果cookie_manager中有对应的实例，获取冷却状态
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
+        # 如果有运行中的 XianyuLive 实例，获取冷却状态
+        from XianyuAutoAsync import XianyuLive
+        instance = XianyuLive.get_instance(cookie_id)
+        if instance:
             remaining_time = instance.get_qr_cookie_refresh_remaining_time()
             cooldown_duration = instance.qr_cookie_refresh_cooldown
             last_refresh_time = instance.last_qr_cookie_refresh_time
@@ -3335,6 +3176,92 @@ async def get_qr_cookie_refresh_cooldown_status(
     except Exception as e:
         log_with_user('error', f"获取扫码登录冷却状态异常: {str(e)}", current_user)
         return {'success': False, 'message': f'获取冷却状态失败: {str(e)}'}
+
+
+@app.post("/cookies/{cookie_id}/refresh-token")
+async def refresh_cookie_token(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """手动触发指定账号刷新闲鱼Token。"""
+    try:
+        log_with_user('info', f"手动触发Token刷新: {cookie_id}", current_user)
+
+        cookie_info = db_manager.get_cookie_by_id(cookie_id)
+        if not cookie_info:
+            return {'success': False, 'message': '账号不存在'}
+
+        instance = None
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if live_instance:
+            instance = live_instance
+            log_with_user('info', f"使用运行中实例刷新Token: {cookie_id}", current_user)
+
+        if instance is None:
+            cookie_value = get_cookie_value_for_open_api(cookie_id)
+            if not cookie_value:
+                return {'success': False, 'message': '未找到可用Cookie'}
+            instance = XianyuLive(
+                cookies_str=cookie_value,
+                cookie_id=cookie_id,
+                user_id=current_user['user_id']
+            )
+            log_with_user('info', f"未找到运行中实例，已用数据库最新Cookie临时创建实例刷新Token: {cookie_id}", current_user)
+
+        try:
+            instance._clear_auth_blocked()
+        except Exception as clear_e:
+            log_with_user('warning', f"清理Token风控冷却失败: {cookie_id}, 错误: {str(clear_e)}", current_user)
+
+        token = await instance.refresh_token(force=True)
+        if token:
+            restart_started = False
+            if cookie_manager.manager:
+                try:
+                    cookie_value = get_cookie_value_for_open_api(cookie_id) or getattr(instance, "cookies_str", "")
+                    if cookie_value:
+                        log_with_user('info', f"Token刷新成功，准备重启账号任务重新注册WebSocket: {cookie_id}", current_user)
+                        manager_loop = cookie_manager.manager.loop
+                        if manager_loop and manager_loop.is_running():
+                            future = asyncio.run_coroutine_threadsafe(
+                                cookie_manager.manager.restart_cookie_task_async(cookie_id, cookie_value, save_to_db=False),
+                                manager_loop
+                            )
+                            await asyncio.wrap_future(future)
+                        else:
+                            await cookie_manager.manager.restart_cookie_task_async(cookie_id, cookie_value, save_to_db=False)
+                        restart_started = True
+                        log_with_user('info', f"账号任务已重启，将使用新Token重新注册WebSocket: {cookie_id}", current_user)
+                    else:
+                        log_with_user('warning', f"Token刷新成功但未找到Cookie，跳过账号任务重启: {cookie_id}", current_user)
+                except Exception as restart_e:
+                    log_with_user('error', f"Token刷新成功但账号任务重启失败: {cookie_id}, 错误: {str(restart_e)}", current_user)
+                    return {
+                        'success': False,
+                        'message': f'Token刷新成功，但账号任务重启失败: {str(restart_e)}',
+                        'cookie_id': cookie_id,
+                        'token_length': len(token)
+                    }
+            return {
+                'success': True,
+                'message': 'Token刷新成功，账号任务已重启' if restart_started else 'Token刷新成功',
+                'cookie_id': cookie_id,
+                'token_length': len(token),
+                'restarted': restart_started
+            }
+
+        last_status = getattr(instance, 'last_token_refresh_status', '')
+        return {
+            'success': False,
+            'message': f'Token刷新失败，当前状态: {last_status or "unknown"}，请查看后台日志中的滑块诊断/风控日志',
+            'cookie_id': cookie_id,
+            'last_status': last_status
+        }
+
+    except Exception as e:
+        log_with_user('error', f"手动刷新Token异常: {str(e)}", current_user)
+        return {'success': False, 'message': f'刷新Token失败: {str(e)}'}
 
 
 @app.put('/cookies/{cid}/status')

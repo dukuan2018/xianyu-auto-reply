@@ -390,19 +390,23 @@ class CookieManager:
         async def _stop_task_async():
             """异步停止任务并等待清理"""
             try:
-                task = self.tasks[cookie_id]
+                task = self.tasks.pop(cookie_id, None)
+                if not task:
+                    logger.warning(f"Cookie任务不存在，跳过停止: {cookie_id}")
+                    return
                 if not task.done():
                     task.cancel()
                     try:
                         # 等待任务完全清理，确保资源释放
-                        await task
+                        await asyncio.wait_for(task, timeout=10.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"等待Cookie任务停止超时，已从任务表移除: {cookie_id}")
                     except asyncio.CancelledError:
                         # 任务被取消是预期行为
                         pass
                     except Exception as e:
                         logger.error(f"等待任务清理时出错: {cookie_id}, {e}")
                     logger.info(f"已取消Cookie任务: {cookie_id}")
-                del self.tasks[cookie_id]
                 logger.info(f"成功停止Cookie任务: {cookie_id}")
             except Exception as e:
                 logger.error(f"停止Cookie任务失败: {cookie_id}, {e}")
@@ -418,7 +422,7 @@ class CookieManager:
                 task = self.tasks[cookie_id]
                 if not task.done():
                     task.cancel()
-                del self.tasks[cookie_id]
+                self.tasks.pop(cookie_id, None)
         except Exception as e:
             logger.error(f"停止Cookie任务失败: {cookie_id}, {e}")
 

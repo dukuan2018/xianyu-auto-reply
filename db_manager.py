@@ -978,6 +978,21 @@ class DBManager:
                 self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN show_browser INTEGER DEFAULT 0")
                 logger.info("为cookies表添加show_browser字段")
 
+            # 为cookies表添加token缓存字段
+            try:
+                self._execute_sql(cursor, "SELECT current_token FROM cookies LIMIT 1")
+                logger.info("cookies表current_token字段已存在")
+            except sqlite3.OperationalError:
+                self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN current_token TEXT DEFAULT ''")
+                logger.info("为cookies表添加current_token字段")
+
+            try:
+                self._execute_sql(cursor, "SELECT last_token_refresh_time FROM cookies LIMIT 1")
+                logger.info("cookies表last_token_refresh_time字段已存在")
+            except sqlite3.OperationalError:
+                self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN last_token_refresh_time REAL DEFAULT 0")
+                logger.info("为cookies表添加last_token_refresh_time字段")
+
             logger.info("✅ cookies表账号登录字段升级完成")
             logger.info("   - username: 用于密码登录的用户名")
             logger.info("   - password: 用于密码登录的密码")
@@ -1311,7 +1326,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at FROM cookies WHERE id = ?", (cookie_id,))
+                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, current_token, last_token_refresh_time, created_at FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     return {
@@ -1324,12 +1339,30 @@ class DBManager:
                         'username': result[6] or '',
                         'password': result[7] or '',
                         'show_browser': bool(result[8]) if result[8] is not None else False,
-                        'created_at': result[9]
+                        'current_token': result[9] or '',
+                        'last_token_refresh_time': result[10] if result[10] is not None else 0,
+                        'created_at': result[11]
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
+
+    def update_cookie_token_cache(self, cookie_id: str, current_token: str = '', last_token_refresh_time: float = 0.0) -> bool:
+        """更新Cookie的token缓存"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET current_token = ?, last_token_refresh_time = ? WHERE id = ?",
+                    (current_token or '', float(last_token_refresh_time or 0), cookie_id)
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"更新Cookie token缓存失败: {cookie_id}, 错误: {e}")
+                return False
 
     def update_auto_confirm(self, cookie_id: str, auto_confirm: bool) -> bool:
         """更新Cookie的自动确认发货设置"""
